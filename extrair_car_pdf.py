@@ -474,6 +474,23 @@ def extrair_dados_demonstrativo(
     return _normalizar_campos(dados)
 
 
+def _separar_propriedade_uf_municipio(bloco: str, numero_car: str):
+    """Separa a tabela SIMCAR usando a UF do CAR, em uma ou várias linhas."""
+    uf = numero_car[:2].upper()
+    ufs = {
+        "AC", "AL", "AP", "AM", "BA", "CE", "DF", "ES", "GO", "MA",
+        "MT", "MS", "MG", "PA", "PB", "PR", "PE", "PI", "RJ", "RN",
+        "RS", "RO", "RR", "SC", "SP", "SE", "TO",
+    }
+    if uf not in ufs:
+        return None
+    texto = " ".join(bloco.split())
+    # A última ocorrência da UF separa as colunas, preservando nomes que
+    # contêm DE, DA, IX ou até a própria sigla do estado.
+    m = re.fullmatch(r"(.+)\s+(" + re.escape(uf) + r")\s+(.+)", texto)
+    return m.groups() if m else None
+
+
 def extrair_dados_recibo_simcar_mt(
     texto: str, caminho_pdf: Path, numero_os: str = ""
 ) -> dict:
@@ -523,12 +540,13 @@ def extrair_dados_recibo_simcar_mt(
         if linhas and re.match(r"(?i)^propriedade\s+uf\s+munic", linhas[0]):
             linhas.pop(0)                       # remove o cabeçalho da tabela
         if linhas:
-            m_uf_mun = re.match(r"^([A-Z]{2})\s+(.+)$", linhas[-1])
-            if m_uf_mun:
-                dados["uf"] = m_uf_mun.group(1).upper()
-                dados["municipio"] = m_uf_mun.group(2).strip()
-                linhas = linhas[:-1]
-            dados["nome_imovel"] = " ".join(" ".join(linhas).split())
+            propriedade = _separar_propriedade_uf_municipio(
+                " ".join(linhas), dados["numero_do_car"]
+            )
+            if propriedade:
+                dados["nome_imovel"], dados["uf"], dados["municipio"] = propriedade
+            else:
+                dados["nome_imovel"] = " ".join(" ".join(linhas).split())
     else:
         dados["nome_imovel"] = _nome_imovel_de_archivo(caminho_pdf)
     dados.setdefault("nome_imovel", "")
@@ -684,10 +702,11 @@ def extrair_dados_demonstrativo_simcar_mt(
         txt, re.DOTALL,
     )
     if propriedade:
-        m = re.fullmatch(r"(.+?)\s+([A-Z]{2})\s+(.+)",
-                         " ".join(propriedade.group(1).split()))
-        if m:
-            dados["nome_imovel"], dados["uf"], dados["municipio"] = m.groups()
+        campos = _separar_propriedade_uf_municipio(
+            propriedade.group(1), dados["numero_do_car"]
+        )
+        if campos:
+            dados["nome_imovel"], dados["uf"], dados["municipio"] = campos
     m = re.search(r"\n([A-Z]{2}\d+/\d{4})\s+([^\n]+)", txt)
     if m:
         dados["numero_car_estadual"] = m.group(1)
