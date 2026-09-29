@@ -3,15 +3,15 @@ extrair_car_pdf.py
 =============================================================================
 
 Script que processa TODOS os PDFs de "Recibo de Inscrição do Imóvel Rural
-no CAR" que estiverem na MESMA PASTA onde este arquivo está.
+no CAR" na pasta deste arquivo e, se BUSCAR_SUBPASTAS = True, nas subpastas.
 
 FUNCIONA COM RECIBOS DE QUALQUER UF (GO, PR, PI, MT, MS, etc.) porque o
 recibo nacional do CAR tem o mesmo layout em todos os estados.
 
 O que ele faz, em ordem:
-  0. Pede o número da OS e registra em todos os PDFs (coluna 'numero_os');
+  0. Usa o nome da subpasta como OS, se habilitado, ou pede a OS no terminal;
   1. Descobre sozinho a pasta onde está, via os.path (__file__);
-  2. Procura todos os arquivos "*.pdf" da pasta;
+  2. Procura todos os arquivos "*.pdf", incluindo subpastas conforme a constante;
   3. Extrai os dados de cada CAR (imóvel, áreas, proprietário, matrículas,
      datas, coordenadas, protocolo, etc.);
   4. Monta / atualiza o JSON "car_dados.json" usando COMO CHAVE sempre o
@@ -70,6 +70,8 @@ except Exception:                                          # noqa: E722
 # =====================================================================
 # 1) LOCALIZAÇÃO AUTOMÁTICA DA PASTA (os.path) + caminhos dos arquivos
 # =====================================================================
+BUSCAR_SUBPASTAS = True  # True: inclui subpastas; False: somente a pasta do script.
+USAR_NOME_SUBPASTA_COMO_OS = True  # Com busca em subpastas, usa a pasta que contém o PDF.
 PASTA_SCRIPT = Path(os.path.dirname(os.path.abspath(__file__)))
 JSON_CAMINHO = PASTA_SCRIPT / "car_dados.json"          # JSON gerado / atualizado
 CSV_CAMINHO = PASTA_SCRIPT / "car_dados.csv"            # CSV gerado / atualizado
@@ -998,7 +1000,7 @@ def extrair_dados_car(texto: str, caminho_pdf: Path, numero_os: str = "") -> dic
     dados = {
         "arquivo_pdf": caminho_pdf.name,
         "path_pdf": str(caminho_pdf),          # caminho absoluto do PDF
-        "numero_os": numero_os,                # número de OS pedido na console
+        "numero_os": numero_os,                # OS da subpasta ou informada na console
     }
 
     # ---------- Chave: número do Registro no CAR (GO-/PR-/PI-/etc.) ----------
@@ -1190,15 +1192,25 @@ def main() -> None:
     print("=" * 72)
     print(f"PASTA DO SCRIPT..........: {PASTA_SCRIPT}")
     print(f"Procurando *.pdf.........: {PASTA_SCRIPT}")
+    print(f"Buscar em subpastas......: {'Sim' if BUSCAR_SUBPASTAS else 'Não'}")
     print("=" * 72)
 
-    pdfs = sorted(PASTA_SCRIPT.glob("*.pdf"))
+    padrao = "**/*.pdf" if BUSCAR_SUBPASTAS else "*.pdf"
+    pdfs = sorted(pdf for pdf in PASTA_SCRIPT.glob(padrao) if pdf.is_file())
     if not pdfs:
-        print("\nNÃO EXISTEN arquivos .pdf nesta pasta. Nada que fazer.\n")
+        print("\nNenhum arquivo .pdf encontrado na busca. Nada a fazer.\n")
         return
 
-    numero_os = solicitar_numero_os()
-    print(f"Número de OS registrado em todos os PDFs: {numero_os}")
+    usar_os_subpasta = BUSCAR_SUBPASTAS and USAR_NOME_SUBPASTA_COMO_OS
+    numero_os = ""
+    if not usar_os_subpasta or any(pdf.parent == PASTA_SCRIPT for pdf in pdfs):
+        numero_os = solicitar_numero_os()
+    if usar_os_subpasta:
+        print("OS dos PDFs em subpastas: nome da pasta que contém cada PDF.")
+        if numero_os:
+            print(f"OS dos PDFs na pasta do script: {numero_os}")
+    else:
+        print(f"Número de OS registrado em todos os PDFs: {numero_os}")
     print("=" * 72)
 
     base = carregar_json()
@@ -1208,13 +1220,19 @@ def main() -> None:
     omitidos: list = []                       # PDFs que não são documentos CAR
 
     for pdf in pdfs:
+        nome_pdf = str(pdf.relative_to(PASTA_SCRIPT))
+        numero_os_pdf = (
+            pdf.parent.name
+            if usar_os_subpasta and pdf.parent != PASTA_SCRIPT
+            else numero_os
+        )
         try:
             texto = extrair_texto_pdf(pdf)
             if not es_documento_car(texto):
-                omitidos.append(pdf.name)
-                print(f"[OMITIDO ] {pdf.name}  (não parece um documento CAR)")
+                omitidos.append(nome_pdf)
+                print(f"[OMITIDO ] {nome_pdf}  (não parece um documento CAR)")
                 continue
-            novo = extrair_dados_car(texto, pdf, numero_os)
+            novo = extrair_dados_car(texto, pdf, numero_os_pdf)
             chave = novo["numero_do_car"]
             agora = agora_iso()
 
@@ -1231,8 +1249,8 @@ def main() -> None:
             novo["atualizado_em"] = agora
             base[chave] = novo                                  # upsert
         except Exception as erro:
-            falhas.append((pdf.name, str(erro)))
-            print(f"[FALHA   ] {pdf.name}  ->  {erro}")
+            falhas.append((nome_pdf, str(erro)))
+            print(f"[FALHA   ] {nome_pdf}  ->  {erro}")
 
     base = _enriquecer_nombres(base)
     base = _enriquecer_area_mesmo_imovel(base)
@@ -1263,7 +1281,7 @@ def main() -> None:
     print("\n" + "=" * 72)
     print("RESUMO FINAL DA EXECUÇÃO")
     print("=" * 72)
-    print(f"  PDFs encontrados na pasta : {len(pdfs)}")
+    print(f"  PDFs encontrados na busca : {len(pdfs)}")
     print(f"  Registros inseridos       : {len(inseridos)}")
     print(f"  Registros atualizados     : {len(atualizados)}")
     print(f"  Documentos não-CAR omítidos : {len(omitidos)}")
@@ -1287,7 +1305,12 @@ def main() -> None:
             print(f"    {n}. {arq}  ->  {motivo}")
 
     print(f"\n  Arquivos gerados:")
-    print(f"    Nº de OS registrado    : {numero_os}")
+    if usar_os_subpasta:
+        print("    Nº de OS registrado    : nome da subpasta de cada PDF")
+        if numero_os:
+            print(f"    OS dos PDFs na raiz    : {numero_os}")
+    else:
+        print(f"    Nº de OS registrado    : {numero_os}")
     print(f"    JSON : {JSON_CAMINHO}")
     if csv_ok:
         print(f"    CSV  : {CSV_CAMINHO}")
