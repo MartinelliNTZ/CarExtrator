@@ -670,6 +670,59 @@ def extrair_dados_recibo_simcar_mt(
     return _normalizar_campos(dados)
 
 
+def extrair_dados_demonstrativo_simcar_mt(
+    texto: str, caminho_pdf: Path, numero_os: str = ""
+) -> dict:
+    """Lê o Demonstrativo de Informações no CAR da SEMA-MT."""
+    dados = extrair_dados_recibo_simcar_mt(texto, caminho_pdf, numero_os)
+    txt = texto.replace("–", "-").replace("—", "-")
+    dados["tipo_documento"] = "Demonstrativo CAR-estadual (SIMCAR)"
+    # O demonstrativo não declara adesão ao PRA como o recibo.
+    dados["aderiu_pra"] = ""
+    propriedade = re.search(
+        r"Propriedade\s+UF\s+Município\s*\n(.*?)\n\s*Proprietários",
+        txt, re.DOTALL,
+    )
+    if propriedade:
+        m = re.fullmatch(r"(.+?)\s+([A-Z]{2})\s+(.+)",
+                         " ".join(propriedade.group(1).split()))
+        if m:
+            dados["nome_imovel"], dados["uf"], dados["municipio"] = m.groups()
+    m = re.search(r"\n([A-Z]{2}\d+/\d{4})\s+([^\n]+)", txt)
+    if m:
+        dados["numero_car_estadual"] = m.group(1)
+        dados["situacao"] = m.group(2).rsplit(" ", 1)[0]
+    m = re.search(
+        r"Data de Cadastro\s+Data da Situação\s*\n"
+        r"(\d{2}/\d{2}/\d{4})\s+(\d{2}/\d{2}/\d{4})", txt,
+    )
+    if m:
+        dados["data_cadastro"], dados["data_situacao"] = m.groups()
+    m = re.search(r"Proprietários\s*\nNome\s*\n(.*?)\nÁreas da Propriedade",
+                  txt, re.DOTALL)
+    if m:
+        nomes = [nome.strip() for nome in m.group(1).splitlines() if nome.strip()]
+        dados["proprietarios"] = [
+            {"nome": nome, "tipo": "", "numero": ""} for nome in nomes
+        ]
+        dados["nome_proprietario"] = " | ".join(nomes)
+    area_total = _valor_tras_label(txt, "Área do Imóvel Rural - AIR")
+    if not area_total:
+        area_total = _valor_tras_label(txt, "Área Total da Propriedade - ATP")
+    for campo in ("area_total_ha", "area_total_imovel_ha", "area_liquida_imovel_ha"):
+        dados[campo] = area_total
+    dados["area_consolidada_ha"] = _valor_tras_label(txt, "Área de Uso Consolidado")
+    dados["remanescente_vegetacao_nativa_ha"] = _valor_tras_label(
+        txt, "Área de Vegetação Nativa Preservada - AVNP")
+    dados["area_app_ha"] = _valor_tras_label(
+        txt, "Área de Preservação Permamente - APP",
+        "Área de Preservação Permanente - APP")
+    dados["area_reserva_legal_ha"] = _valor_tras_label(
+        txt, "Área de Reserva Legal Preservada - ARLP")
+    dados["area_reserva_legal_existente_ha"] = dados["area_reserva_legal_ha"]
+    return _normalizar_campos(dados)
+
+
 def _campo_linea(texto: str, padrao: str) -> str:
     m = re.search(padrao, texto)
     return m.group(1).strip() if m else ""
@@ -987,6 +1040,9 @@ def extrair_dados_car(texto: str, caminho_pdf: Path, numero_os: str = "") -> dic
             or ("CADASTRO AMBIENTAL RURAL DO" in texto and "ÁREAS DO IMÓVEL" in texto)):
         return extrair_dados_certificado_ms(texto, caminho_pdf, numero_os)
 
+    if "Demonstrativo de Informações no CAR" in texto:
+        return extrair_dados_demonstrativo_simcar_mt(texto, caminho_pdf, numero_os)
+
     # Recibo de Inscrição CAR estadual (SIMCAR/MT e estados com mesmo layout)
     if ("Nº Recibo Federal" in texto
             or re.search(r"Recibo de Inscrição\s+CAR\s*[–\-]\s*[A-Z]{2}", texto)):
@@ -1218,6 +1274,8 @@ def main() -> None:
     atualizados: list = []
     falhas: list = []
     omitidos: list = []                       # PDFs que não são documentos CAR
+    pdfs_com_area_total = 0
+    pdfs_com_area_consolidada = 0
 
     for pdf in pdfs:
         nome_pdf = str(pdf.relative_to(PASTA_SCRIPT))
@@ -1233,6 +1291,15 @@ def main() -> None:
                 print(f"[OMITIDO ] {nome_pdf}  (não parece um documento CAR)")
                 continue
             novo = extrair_dados_car(texto, pdf, numero_os_pdf)
+            # Conta por PDF, mesmo quando vários documentos têm o mesmo CAR.
+            # Zero é uma área informada; vazio/None/hífen indicam ausência.
+            pdfs_com_area_total += any(
+                novo.get(campo) not in (None, "", "-")
+                for campo in ("area_total_ha", "area_total_imovel_ha")
+            )
+            pdfs_com_area_consolidada += (
+                novo.get("area_consolidada_ha") not in (None, "", "-")
+            )
             chave = novo["numero_do_car"]
             agora = agora_iso()
 
@@ -1286,6 +1353,8 @@ def main() -> None:
     print(f"  Registros atualizados     : {len(atualizados)}")
     print(f"  Documentos não-CAR omítidos : {len(omitidos)}")
     print(f"  PDFs com falha            : {len(falhas)}")
+    print(f"  PDFs com área total       : {pdfs_com_area_total} de {len(pdfs)}")
+    print(f"  PDFs com área consolidada : {pdfs_com_area_consolidada} de {len(pdfs)}")
 
     if inseridos:
         print("\n  INSERIDOS:")
