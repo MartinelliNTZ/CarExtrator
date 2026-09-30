@@ -290,12 +290,12 @@ def extrair_dados_demonstrativo(
     }
 
     m = re.search(
-        r"Registro (?:no|de Inscrição no) CAR:\s*\n?\s*([A-Z]{2}-\d+-[A-Za-z0-9]+)",
+        r"Registro (?:no|de Inscrição no) CAR:\s*([A-Z]{2}-\d+-\s*[A-Za-z0-9.]+)",
         texto,
     )
     if not m:
         raise RuntimeError("não encontrei o número do 'Registro no CAR' no PDF")
-    dados["numero_do_car"] = m.group(1)
+    dados["numero_do_car"] = re.sub(r"\s+", "", m.group(1))
 
     dados["nome_imovel"] = _nome_imovel_de_archivo(caminho_pdf)
 
@@ -338,12 +338,12 @@ def extrair_dados_demonstrativo(
             m = re.search(r"Longitude:\s*([^\n]+)", texto)
             dados["longitude"] = m.group(1).strip() if m else ""
 
-    m = re.search(r"Área do Imóvel(?: Rural)?\s*:?\s*(?:ha\s*)?\s*([\d.,]+)", texto)
+    m = re.search(r"Área\s+do\s+Imóvel(?:\s+Rural)?\s*:?\s*(?:ha\s*)?\s*([\d.,]+)", texto)
     area_imovel = m.group(1) if m else ""
     dados["area_total_imovel_ha"] = area_imovel
     dados["area_total_ha"] = area_imovel                # alias útil
 
-    m = re.search(r"Módulos Fiscais:\s*([\d.,]+)", texto, re.IGNORECASE)
+    m = re.search(r"Módulos\s+Fiscais:\s*([\d.,]+)", texto, re.IGNORECASE)
     dados["modulos_fiscais"] = m.group(1) if m else ""
 
     dados["codigo_protocolo"] = ""
@@ -1263,6 +1263,11 @@ def solicitar_numero_os() -> str:
         print("O número da OS não pode ficar vazio. Tente de novo.")
 
 
+def _chave_car_comparacao(chave: str) -> str:
+    """Compara o mesmo CAR com ou sem pontos e espaços, sem alterar a base."""
+    return re.sub(r"[.\s]+", "", chave).upper()
+
+
 def main() -> None:
     print("=" * 72)
     print(f"PASTA DO SCRIPT..........: {PASTA_SCRIPT}")
@@ -1293,6 +1298,8 @@ def main() -> None:
     atualizados: list = []
     falhas: list = []
     omitidos: list = []                       # PDFs que não são documentos CAR
+    preservados: list = []                    # FGOV cujo CAR já existe
+    extraidos: list = []
     pdfs_com_area_total = 0
     pdfs_com_area_consolidada = 0
 
@@ -1310,6 +1317,26 @@ def main() -> None:
                 print(f"[OMITIDO ] {nome_pdf}  (não parece um documento CAR)")
                 continue
             novo = extrair_dados_car(texto, pdf, numero_os_pdf)
+            eh_fgov = "Regularização Ambiental - Cadastro Ambiental Rural" in texto
+            extraidos.append((eh_fgov, nome_pdf, novo))
+        except Exception as erro:
+            falhas.append((nome_pdf, str(erro)))
+            print(f"[FALHA   ] {nome_pdf}  ->  {erro}")
+
+    arquivos_por_car = {}
+    for _, nome_pdf, dados in extraidos:
+        chave = _chave_car_comparacao(dados["numero_do_car"])
+        arquivos_por_car.setdefault(chave, []).append(nome_pdf)
+    cars_repetidos = {
+        chave: arquivos for chave, arquivos in arquivos_por_car.items()
+        if len(arquivos) > 1
+    }
+
+    # Recibos têm prioridade; FGOV só completa CARs ausentes, independentemente
+    # da ordem dos nomes dos arquivos e da pontuação usada no número do CAR.
+    chaves_existentes = {_chave_car_comparacao(chave): chave for chave in base}
+    for eh_fgov, nome_pdf, novo in sorted(extraidos, key=lambda item: item[0]):
+        try:
             # Conta por PDF, mesmo quando vários documentos têm o mesmo CAR.
             # Zero é uma área informada; vazio/None/hífen indicam ausência.
             pdfs_com_area_total += any(
@@ -1320,6 +1347,13 @@ def main() -> None:
                 novo.get("area_consolidada_ha") not in (None, "", "-")
             )
             chave = novo["numero_do_car"]
+            chave_comparacao = _chave_car_comparacao(chave)
+            if eh_fgov and chave_comparacao in chaves_existentes:
+                preservados.append(nome_pdf)
+                print(f"[MANTIDO ] {nome_pdf}  (CAR já existe na base)")
+                continue
+            chave = chaves_existentes.get(chave_comparacao, chave)
+            novo["numero_do_car"] = chave
             agora = agora_iso()
 
             if chave in base:                                   # ATUALIZAÇÃO
@@ -1334,6 +1368,7 @@ def main() -> None:
 
             novo["atualizado_em"] = agora
             base[chave] = novo                                  # upsert
+            chaves_existentes[chave_comparacao] = chave
         except Exception as erro:
             falhas.append((nome_pdf, str(erro)))
             print(f"[FALHA   ] {nome_pdf}  ->  {erro}")
@@ -1367,13 +1402,6 @@ def main() -> None:
     print("\n" + "=" * 72)
     print("RESUMO FINAL DA EXECUÇÃO")
     print("=" * 72)
-    print(f"  PDFs encontrados na busca : {len(pdfs)}")
-    print(f"  Registros inseridos       : {len(inseridos)}")
-    print(f"  Registros atualizados     : {len(atualizados)}")
-    print(f"  Documentos não-CAR omítidos : {len(omitidos)}")
-    print(f"  PDFs com falha            : {len(falhas)}")
-    print(f"  PDFs com área total       : {pdfs_com_area_total} de {len(pdfs)}")
-    print(f"  PDFs com área consolidada : {pdfs_com_area_consolidada} de {len(pdfs)}")
 
     if inseridos:
         print("\n  INSERIDOS:")
@@ -1383,6 +1411,12 @@ def main() -> None:
         print("\n  ATUALIZAÇÕES:")
         for n, ch in enumerate(atualizados, 1):
             print(f"    {n}. {ch}")
+    if cars_repetidos:
+        print("\n  CARs PRESENTES EM MAIS DE UM PDF (inclui FGOV preservados):")
+        for n, (chave, arquivos) in enumerate(sorted(cars_repetidos.items()), 1):
+            print(f"    {n}. {chave} — {len(arquivos)} PDFs")
+            for arquivo in arquivos:
+                print(f"       - {arquivo}")
     if omitidos:
         print("\n  OMITIDOS (não são documentos CAR):")
         for n, arq in enumerate(omitidos, 1):
@@ -1413,6 +1447,16 @@ def main() -> None:
             print("  !!! ATENÇÃO: nº de chaves diverge do nº de filas do CSV !!!")
     else:
         print(f"  Linhas no CSV (sem cabeça) : -- (CSV bloqueado)")
+    print()
+    print(f"  PDFs encontrados na busca : {len(pdfs)}")
+    print(f"  Registros inseridos       : {len(inseridos)}")
+    print(f"  Registros atualizados     : {len(atualizados)}")
+    print(f"  CARs em mais de um PDF    : {len(cars_repetidos)}")
+    print(f"  Documentos não-CAR omítidos : {len(omitidos)}")
+    print(f"  FGOV com CAR já existente : {len(preservados)}")
+    print(f"  PDFs com falha            : {len(falhas)}")
+    print(f"  PDFs com área total       : {pdfs_com_area_total} de {len(pdfs)}")
+    print(f"  PDFs com área consolidada : {pdfs_com_area_consolidada} de {len(pdfs)}")
     print("=" * 72)
     try:
         input("Fim (pressione Enter): ")
