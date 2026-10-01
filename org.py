@@ -793,7 +793,7 @@ class GerenciadorPastas(QMainWindow):
             [
                 p
                 for p in self.pasta_mae.iterdir()
-                if p.is_dir()
+                if p.name.startswith("OS_") and p.is_dir()
             ],
             key=lambda p: p.name.lower(),
         )
