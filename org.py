@@ -9,7 +9,10 @@ from PySide6.QtCore import (
     Signal,
     QRunnable,
     QThreadPool,
-    QSize,
+    QTimer,
+    QPropertyAnimation,
+    QEasingCurve,
+    QPoint,
 )
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
@@ -29,11 +32,12 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QFrame,
     QLineEdit,
+    QGraphicsOpacityEffect,
 )
 
 
 # ==========================================================
-# CONFIGURAÇÕES
+# CONFIGURAÇÃO
 # ==========================================================
 
 PASTA_MAE_PADRAO = Path(
@@ -71,18 +75,16 @@ COR_DOURADO_CLARO = "#F1D675"
 COR_TEXTO = "#EEEEEE"
 COR_TEXTO_SECUNDARIO = "#A9A9A9"
 
-COR_OK = "#5CB85C"
+COR_OK = "#61C975"
 COR_ERRO = "#E85D5D"
 COR_AVISO = "#E6A23C"
-COR_AZUL = "#5B9BD5"
 
 
 # ==========================================================
-# FUNÇÕES AUXILIARES
+# AUXILIARES
 # ==========================================================
 
-def formatar_tamanho(bytes_total: int) -> str:
-    """Converte bytes para unidade legível."""
+def formatar_tamanho(bytes_total):
     unidades = ["B", "KB", "MB", "GB", "TB"]
 
     tamanho = float(bytes_total)
@@ -91,6 +93,7 @@ def formatar_tamanho(bytes_total: int) -> str:
         if tamanho < 1024:
             if unidade in ("GB", "TB"):
                 return f"{tamanho:.2f} {unidade}"
+
             return f"{tamanho:.1f} {unidade}"
 
         tamanho /= 1024
@@ -98,14 +101,7 @@ def formatar_tamanho(bytes_total: int) -> str:
     return f"{tamanho:.2f} PB"
 
 
-def obter_estatisticas_pasta(caminho: Path):
-    """
-    Conta recursivamente:
-    - arquivos
-    - subpastas
-    - bytes
-    """
-
+def obter_estatisticas_pasta(caminho):
     arquivos = 0
     subpastas = 0
     tamanho = 0
@@ -115,8 +111,8 @@ def obter_estatisticas_pasta(caminho: Path):
             subpastas += len(dirs)
             arquivos += len(files)
 
-            for nome_arquivo in files:
-                arquivo = Path(raiz) / nome_arquivo
+            for nome in files:
+                arquivo = Path(raiz) / nome
 
                 try:
                     tamanho += arquivo.stat().st_size
@@ -129,17 +125,20 @@ def obter_estatisticas_pasta(caminho: Path):
     return arquivos, subpastas, tamanho
 
 
-def abrir_explorer(caminho: Path):
+def abrir_explorer(caminho):
     try:
+        caminho = Path(caminho)
+
         if sys.platform.startswith("win"):
             os.startfile(str(caminho))
+
+        elif sys.platform == "darwin":
+            import subprocess
+            subprocess.Popen(["open", str(caminho)])
+
         else:
             import subprocess
-
-            if sys.platform == "darwin":
-                subprocess.Popen(["open", str(caminho)])
-            else:
-                subprocess.Popen(["xdg-open", str(caminho)])
+            subprocess.Popen(["xdg-open", str(caminho)])
 
     except Exception as erro:
         QMessageBox.critical(
@@ -150,28 +149,186 @@ def abrir_explorer(caminho: Path):
 
 
 # ==========================================================
-# WORKER PARA ESTATÍSTICAS
+# TOAST
+# ==========================================================
+
+class Toast(QFrame):
+
+    def __init__(
+        self,
+        parent,
+        mensagem,
+        tipo="sucesso",
+        duracao=2500,
+    ):
+        super().__init__(parent)
+
+        self.duracao = duracao
+
+        self.setAttribute(
+            Qt.WA_TransparentForMouseEvents
+        )
+
+        self.setObjectName("toast")
+
+        cores = {
+            "sucesso": ("#163D21", "#61C975"),
+            "erro": ("#451D1D", "#E85D5D"),
+            "aviso": ("#493A17", "#E6A23C"),
+            "info": ("#1A3348", "#5EA8E5"),
+        }
+
+        fundo, borda = cores.get(
+            tipo,
+            cores["sucesso"]
+        )
+
+        self.setStyleSheet(
+            f"""
+            QFrame#toast {{
+                background-color: {fundo};
+                border: 1px solid {borda};
+                border-radius: 8px;
+            }}
+
+            QLabel {{
+                background: transparent;
+                color: #FFFFFF;
+                font-size: 10pt;
+                padding: 3px;
+            }}
+            """
+        )
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 10)
+
+        icones = {
+            "sucesso": "✓",
+            "erro": "✕",
+            "aviso": "!",
+            "info": "i",
+        }
+
+        lbl_icone = QLabel(
+            icones.get(tipo, "✓")
+        )
+
+        lbl_icone.setStyleSheet(
+            f"""
+            color: {borda};
+            font-size: 14pt;
+            font-weight: bold;
+            """
+        )
+
+        lbl_texto = QLabel(mensagem)
+
+        layout.addWidget(lbl_icone)
+        layout.addWidget(lbl_texto)
+
+        self.adjustSize()
+
+        self.opacity_effect = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self.opacity_effect)
+
+        self.opacity_effect.setOpacity(0)
+
+        self.animacao_entrada = QPropertyAnimation(
+            self.opacity_effect,
+            b"opacity",
+            self,
+        )
+
+        self.animacao_entrada.setDuration(180)
+        self.animacao_entrada.setStartValue(0)
+        self.animacao_entrada.setEndValue(1)
+
+        self.animacao_saida = QPropertyAnimation(
+            self.opacity_effect,
+            b"opacity",
+            self,
+        )
+
+        self.animacao_saida.setDuration(300)
+        self.animacao_saida.setStartValue(1)
+        self.animacao_saida.setEndValue(0)
+
+        self.animacao_saida.finished.connect(
+            self.deleteLater
+        )
+
+    def mostrar(self):
+        parent = self.parentWidget()
+
+        margem = 20
+
+        x = (
+            parent.width()
+            - self.width()
+            - margem
+        )
+
+        y = (
+            parent.height()
+            - self.height()
+            - margem
+        )
+
+        self.move(x, y)
+
+        self.raise_()
+        self.show()
+
+        self.animacao_entrada.start()
+
+        QTimer.singleShot(
+            self.duracao,
+            self.fechar,
+        )
+
+    def fechar(self):
+        self.animacao_saida.start()
+
+
+# ==========================================================
+# WORKER
 # ==========================================================
 
 class WorkerSignals(QObject):
-    finalizado = Signal(object, int, int, int)
+    finalizado = Signal(
+        object,
+        str,
+        int,
+        int,
+        int,
+    )
 
 
 class EstatisticasWorker(QRunnable):
-    def __init__(self, item, caminho):
+
+    def __init__(
+        self,
+        item,
+        caminho,
+    ):
         super().__init__()
 
         self.item = item
         self.caminho = Path(caminho)
+
         self.signals = WorkerSignals()
 
     def run(self):
-        arquivos, subpastas, tamanho = obter_estatisticas_pasta(
-            self.caminho
+        arquivos, subpastas, tamanho = (
+            obter_estatisticas_pasta(
+                self.caminho
+            )
         )
 
         self.signals.finalizado.emit(
             self.item,
+            str(self.caminho),
             arquivos,
             subpastas,
             tamanho,
@@ -189,19 +346,30 @@ class GerenciadorPastas(QMainWindow):
 
         self.pasta_mae = PASTA_MAE_PADRAO
 
-        self.thread_pool = QThreadPool.globalInstance()
-
-        self.setWindowTitle(
-            "AGROROBÓTICA | Gerenciador de Estrutura VERRA Farmer"
+        self.thread_pool = (
+            QThreadPool.globalInstance()
         )
 
-        self.resize(1500, 900)
-        self.setMinimumSize(1100, 650)
+        self.setWindowTitle(
+            "AGROROBÓTICA | Gerenciador VERRA Farmer"
+        )
+
+        self.resize(
+            1500,
+            900,
+        )
+
+        self.setMinimumSize(
+            1100,
+            650,
+        )
 
         self.criar_interface()
         self.aplicar_estilo()
 
-        self.carregar_projetos()
+        self.carregar_projetos(
+            exibir_toast=False
+        )
 
     # ======================================================
     # INTERFACE
@@ -214,19 +382,25 @@ class GerenciadorPastas(QMainWindow):
 
         layout = QVBoxLayout(central)
 
-        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setContentsMargins(
+            20,
+            20,
+            20,
+            20,
+        )
+
         layout.setSpacing(15)
 
-        # --------------------------------------------------
-        # CABEÇALHO
-        # --------------------------------------------------
+        # Cabeçalho
 
         header = QFrame()
         header.setObjectName("header")
 
         header_layout = QVBoxLayout(header)
 
-        titulo = QLabel("GERENCIADOR DE ESTRUTURA DE PROJETOS")
+        titulo = QLabel(
+            "GERENCIADOR DE ESTRUTURA DE PROJETOS"
+        )
         titulo.setObjectName("titulo")
 
         subtitulo = QLabel(
@@ -239,13 +413,13 @@ class GerenciadorPastas(QMainWindow):
 
         layout.addWidget(header)
 
-        # --------------------------------------------------
-        # PASTA MÃE
-        # --------------------------------------------------
+        # Barra pasta
 
         barra = QHBoxLayout()
 
-        label_pasta = QLabel("Pasta mãe:")
+        barra.addWidget(
+            QLabel("Pasta mãe:")
+        )
 
         self.input_pasta = QLineEdit(
             str(self.pasta_mae)
@@ -253,81 +427,108 @@ class GerenciadorPastas(QMainWindow):
 
         self.input_pasta.setReadOnly(True)
 
-        btn_escolher = QPushButton("Selecionar pasta")
+        barra.addWidget(
+            self.input_pasta,
+            1,
+        )
+
+        btn_escolher = QPushButton(
+            "Selecionar pasta"
+        )
+
         btn_escolher.clicked.connect(
             self.selecionar_pasta_mae
         )
 
-        self.btn_atualizar = QPushButton("↻ Atualizar")
-        self.btn_atualizar.setObjectName("btnPrincipal")
-        self.btn_atualizar.clicked.connect(
-            self.carregar_projetos
+        barra.addWidget(
+            btn_escolher
         )
 
-        barra.addWidget(label_pasta)
-        barra.addWidget(self.input_pasta, 1)
-        barra.addWidget(btn_escolher)
-        barra.addWidget(self.btn_atualizar)
+        self.btn_atualizar = QPushButton(
+            "↻ Atualizar"
+        )
+
+        self.btn_atualizar.setObjectName(
+            "btnPrincipal"
+        )
+
+        self.btn_atualizar.clicked.connect(
+            lambda:
+            self.carregar_projetos(
+                exibir_toast=True
+            )
+        )
+
+        barra.addWidget(
+            self.btn_atualizar
+        )
 
         layout.addLayout(barra)
 
-        # --------------------------------------------------
-        # RESUMO
-        # --------------------------------------------------
+        # Cards
 
         resumo = QHBoxLayout()
 
         self.lbl_projetos = self.criar_card(
-            "Projetos", "0"
+            "Projetos",
+            "0",
         )
 
         self.lbl_corretas = self.criar_card(
-            "Pastas corretas", "0"
+            "Pastas corretas",
+            "0",
         )
 
         self.lbl_incorretas = self.criar_card(
-            "Incoerentes", "0"
+            "Incoerentes",
+            "0",
         )
 
         self.lbl_ausentes = self.criar_card(
-            "Ausentes", "0"
+            "Ausentes",
+            "0",
         )
 
-        resumo.addWidget(self.lbl_projetos["frame"])
-        resumo.addWidget(self.lbl_corretas["frame"])
-        resumo.addWidget(self.lbl_incorretas["frame"])
-        resumo.addWidget(self.lbl_ausentes["frame"])
+        for card in (
+            self.lbl_projetos,
+            self.lbl_corretas,
+            self.lbl_incorretas,
+            self.lbl_ausentes,
+        ):
+            resumo.addWidget(
+                card["frame"]
+            )
 
         layout.addLayout(resumo)
 
-        # --------------------------------------------------
-        # FILTRO
-        # --------------------------------------------------
+        # Pesquisa
 
-        filtro_layout = QHBoxLayout()
+        pesquisa_layout = QHBoxLayout()
 
-        lbl = QLabel("Pesquisar projeto:")
+        pesquisa_layout.addWidget(
+            QLabel("Pesquisar projeto:")
+        )
 
         self.input_pesquisa = QLineEdit()
+
         self.input_pesquisa.setPlaceholderText(
-            "Digite parte do nome da pasta/projeto..."
+            "Digite parte do nome..."
         )
 
         self.input_pesquisa.textChanged.connect(
             self.filtrar_projetos
         )
 
-        filtro_layout.addWidget(lbl)
-        filtro_layout.addWidget(
+        pesquisa_layout.addWidget(
             self.input_pesquisa,
             1,
         )
 
-        layout.addLayout(filtro_layout)
+        layout.addLayout(
+            pesquisa_layout
+        )
 
-        # --------------------------------------------------
-        # TREE
-        # --------------------------------------------------
+        # Tree
 
         self.tree = QTreeWidget()
 
@@ -344,7 +545,6 @@ class GerenciadorPastas(QMainWindow):
             ]
         )
 
-        self.tree.setAlternatingRowColors(False)
         self.tree.setAnimated(True)
         self.tree.setIndentation(24)
 
@@ -355,32 +555,21 @@ class GerenciadorPastas(QMainWindow):
             QHeaderView.Stretch,
         )
 
-        header.setSectionResizeMode(
-            1,
-            QHeaderView.ResizeToContents,
-        )
-
-        header.setSectionResizeMode(
-            2,
-            QHeaderView.ResizeToContents,
-        )
-
-        header.setSectionResizeMode(
-            3,
-            QHeaderView.ResizeToContents,
-        )
-
-        header.setSectionResizeMode(
-            4,
-            QHeaderView.ResizeToContents,
-        )
+        for coluna in (1, 2, 3, 4):
+            header.setSectionResizeMode(
+                coluna,
+                QHeaderView.ResizeToContents,
+            )
 
         header.setSectionResizeMode(
             5,
             QHeaderView.Fixed,
         )
 
-        self.tree.setColumnWidth(5, 310)
+        self.tree.setColumnWidth(
+            5,
+            310,
+        )
 
         self.tree.itemDoubleClicked.connect(
             self.duplo_clique_item
@@ -391,39 +580,68 @@ class GerenciadorPastas(QMainWindow):
             1,
         )
 
-        # --------------------------------------------------
-        # LEGENDA
-        # --------------------------------------------------
-
         legenda = QLabel(
-            "● Verde = padrão correto     "
-            "● Vermelho = nome incoerente     "
-            "● Laranja = pasta padrão ausente"
+            "● Verde = correto    "
+            "● Vermelho = incoerente    "
+            "● Laranja = ausente"
         )
 
-        legenda.setObjectName("legenda")
+        legenda.setObjectName(
+            "legenda"
+        )
 
-        layout.addWidget(legenda)
+        layout.addWidget(
+            legenda
+        )
+
+    # ======================================================
+    # TOAST
+    # ======================================================
+
+    def mostrar_toast(
+        self,
+        mensagem,
+        tipo="sucesso",
+    ):
+        toast = Toast(
+            self.centralWidget(),
+            mensagem,
+            tipo,
+        )
+
+        toast.mostrar()
 
     # ======================================================
     # CARD
     # ======================================================
 
-    def criar_card(self, titulo, valor):
-
+    def criar_card(
+        self,
+        titulo,
+        valor,
+    ):
         frame = QFrame()
         frame.setObjectName("card")
 
         layout = QVBoxLayout(frame)
 
         titulo_label = QLabel(titulo)
-        titulo_label.setObjectName("cardTitulo")
+        titulo_label.setObjectName(
+            "cardTitulo"
+        )
 
         valor_label = QLabel(valor)
-        valor_label.setObjectName("cardValor")
+        valor_label.setObjectName(
+            "cardValor"
+        )
 
-        layout.addWidget(titulo_label)
-        layout.addWidget(valor_label)
+        layout.addWidget(
+            titulo_label
+        )
+
+        layout.addWidget(
+            valor_label
+        )
 
         return {
             "frame": frame,
@@ -431,35 +649,153 @@ class GerenciadorPastas(QMainWindow):
         }
 
     # ======================================================
-    # CARREGAMENTO
+    # SALVAR ESTADO DA ÁRVORE
     # ======================================================
 
-    def carregar_projetos(self):
+    def salvar_estado_tree(self):
 
-        caminho_texto = self.input_pasta.text().strip()
+        expandidos = set()
 
-        if caminho_texto:
-            self.pasta_mae = Path(caminho_texto)
+        selecionado = None
 
-        if not self.pasta_mae.exists():
+        scroll_vertical = (
+            self.tree.verticalScrollBar().value()
+        )
 
-            QMessageBox.warning(
-                self,
-                "Pasta não encontrada",
-                f"A pasta mãe não existe:\n\n{self.pasta_mae}",
+        for i in range(
+            self.tree.topLevelItemCount()
+        ):
+            item = self.tree.topLevelItem(i)
+
+            caminho = item.data(
+                0,
+                Qt.UserRole,
+            )
+
+            if (
+                caminho
+                and item.isExpanded()
+            ):
+                expandidos.add(
+                    caminho
+                )
+
+        atual = self.tree.currentItem()
+
+        if atual:
+            selecionado = atual.data(
+                0,
+                Qt.UserRole
+            )
+
+        return {
+            "expandidos": expandidos,
+            "selecionado": selecionado,
+            "scroll": scroll_vertical,
+        }
+
+    def restaurar_estado_tree(
+        self,
+        estado,
+    ):
+
+        selecionado = estado.get(
+            "selecionado"
+        )
+
+        expandidos = estado.get(
+            "expandidos",
+            set(),
+        )
+
+        for i in range(
+            self.tree.topLevelItemCount()
+        ):
+
+            projeto_item = (
+                self.tree.topLevelItem(i)
+            )
+
+            caminho = projeto_item.data(
+                0,
+                Qt.UserRole,
+            )
+
+            if caminho in expandidos:
+                projeto_item.setExpanded(
+                    True
+                )
+
+            if caminho == selecionado:
+                self.tree.setCurrentItem(
+                    projeto_item
+                )
+
+            for j in range(
+                projeto_item.childCount()
+            ):
+
+                child = projeto_item.child(j)
+
+                caminho_child = child.data(
+                    0,
+                    Qt.UserRole,
+                )
+
+                if caminho_child == selecionado:
+                    self.tree.setCurrentItem(
+                        child
+                    )
+
+        QTimer.singleShot(
+            0,
+            lambda:
+            self.tree.verticalScrollBar().setValue(
+                estado.get(
+                    "scroll",
+                    0,
+                )
+            ),
+        )
+
+    # ======================================================
+    # CARREGAMENTO GERAL
+    # ======================================================
+
+    def carregar_projetos(
+        self,
+        exibir_toast=True,
+    ):
+
+        caminho = Path(
+            self.input_pasta.text()
+        )
+
+        if not caminho.exists():
+
+            self.mostrar_toast(
+                "Pasta mãe não encontrada.",
+                "erro",
             )
 
             return
+
+        self.pasta_mae = caminho
+
+        # SALVA ESTADO
+        estado = self.salvar_estado_tree()
+
+        self.tree.setUpdatesEnabled(False)
 
         self.tree.clear()
 
         projetos = sorted(
             [
-                item
-                for item in self.pasta_mae.iterdir()
-                if item.is_dir()
+                p
+                for p in self.pasta_mae.iterdir()
+                if p.is_dir()
             ],
-            key=lambda x: x.name.lower(),
+            key=lambda p: p.name.lower(),
         )
 
         total_corretas = 0
@@ -468,13 +804,15 @@ class GerenciadorPastas(QMainWindow):
 
         for projeto in projetos:
 
-            projeto_item = self.criar_item_projeto(
-                projeto
+            projeto_item = (
+                self.criar_item_projeto(
+                    projeto
+                )
             )
 
             (
                 corretas,
-                incorretas,
+                incoerentes,
                 ausentes,
             ) = self.carregar_pastas_projeto(
                 projeto_item,
@@ -482,13 +820,15 @@ class GerenciadorPastas(QMainWindow):
             )
 
             total_corretas += corretas
-            total_incorretas += incorretas
+            total_incorretas += incoerentes
             total_ausentes += ausentes
 
             self.carregar_estatisticas(
                 projeto_item,
                 projeto,
             )
+
+        self.tree.setUpdatesEnabled(True)
 
         self.lbl_projetos["valor"].setText(
             str(len(projetos))
@@ -506,11 +846,25 @@ class GerenciadorPastas(QMainWindow):
             str(total_ausentes)
         )
 
+        self.restaurar_estado_tree(
+            estado
+        )
+
+        if exibir_toast:
+
+            self.mostrar_toast(
+                "Estrutura atualizada com sucesso.",
+                "sucesso",
+            )
+
     # ======================================================
-    # ITEM PROJETO
+    # PROJETO
     # ======================================================
 
-    def criar_item_projeto(self, projeto):
+    def criar_item_projeto(
+        self,
+        projeto,
+    ):
 
         item = QTreeWidgetItem(
             self.tree
@@ -526,20 +880,9 @@ class GerenciadorPastas(QMainWindow):
             "PROJETO",
         )
 
-        item.setText(
-            2,
-            "...",
-        )
-
-        item.setText(
-            3,
-            "...",
-        )
-
-        item.setText(
-            4,
-            "...",
-        )
+        item.setText(2, "...")
+        item.setText(3, "...")
+        item.setText(4, "...")
 
         item.setData(
             0,
@@ -555,7 +898,6 @@ class GerenciadorPastas(QMainWindow):
 
         fonte = QFont()
         fonte.setBold(True)
-        fonte.setPointSize(10)
 
         item.setFont(
             0,
@@ -572,11 +914,9 @@ class GerenciadorPastas(QMainWindow):
             QColor(COR_DOURADO),
         )
 
-        widget_acoes = QWidget()
+        widget = QWidget()
 
-        layout = QHBoxLayout(
-            widget_acoes
-        )
+        layout = QHBoxLayout(widget)
 
         layout.setContentsMargins(
             2,
@@ -594,22 +934,21 @@ class GerenciadorPastas(QMainWindow):
             abrir_explorer(p)
         )
 
-        btn_adicionar = QToolButton()
+        btn_add = QToolButton()
 
-        btn_adicionar.setText(
+        btn_add.setText(
             "+ Adicionar pasta"
         )
 
-        btn_adicionar.setPopupMode(
+        btn_add.setPopupMode(
             QToolButton.InstantPopup
         )
 
-        menu = self.criar_menu_adicionar(
-            projeto
-        )
-
-        btn_adicionar.setMenu(
-            menu
+        btn_add.setMenu(
+            self.criar_menu_adicionar(
+                projeto,
+                item,
+            )
         )
 
         layout.addWidget(
@@ -617,19 +956,19 @@ class GerenciadorPastas(QMainWindow):
         )
 
         layout.addWidget(
-            btn_adicionar
+            btn_add
         )
 
         self.tree.setItemWidget(
             item,
             5,
-            widget_acoes,
+            widget,
         )
 
         return item
 
     # ======================================================
-    # PASTAS DO PROJETO
+    # PASTAS PROJETO
     # ======================================================
 
     def carregar_pastas_projeto(
@@ -639,45 +978,39 @@ class GerenciadorPastas(QMainWindow):
     ):
 
         try:
-            pastas_existentes = sorted(
+            pastas = sorted(
                 [
                     p
                     for p in projeto.iterdir()
                     if p.is_dir()
                 ],
-                key=lambda x: x.name.lower(),
+                key=lambda p: p.name.lower(),
             )
 
         except Exception:
-            pastas_existentes = []
+            pastas = []
 
-        nomes_existentes = {
+        nomes = {
             p.name
-            for p in pastas_existentes
+            for p in pastas
         }
 
         corretas = 0
-        incorretas = 0
+        incoerentes = 0
 
-        # --------------------------------------------------
-        # PASTAS EXISTENTES
-        # --------------------------------------------------
-
-        for pasta in pastas_existentes:
+        for pasta in pastas:
 
             if pasta.name in PASTAS_PADRAO:
 
                 status = "CORRETA"
                 cor = COR_OK
-
                 corretas += 1
 
             else:
 
                 status = "INCOERENTE"
                 cor = COR_ERRO
-
-                incorretas += 1
+                incoerentes += 1
 
             item = QTreeWidgetItem(
                 projeto_item
@@ -693,20 +1026,9 @@ class GerenciadorPastas(QMainWindow):
                 status,
             )
 
-            item.setText(
-                2,
-                "...",
-            )
-
-            item.setText(
-                3,
-                "...",
-            )
-
-            item.setText(
-                4,
-                "...",
-            )
+            item.setText(2, "...")
+            item.setText(3, "...")
+            item.setText(4, "...")
 
             item.setForeground(
                 0,
@@ -733,6 +1055,7 @@ class GerenciadorPastas(QMainWindow):
             self.adicionar_acoes_pasta(
                 item,
                 pasta,
+                projeto_item,
             )
 
             self.carregar_estatisticas(
@@ -740,17 +1063,13 @@ class GerenciadorPastas(QMainWindow):
                 pasta,
             )
 
-        # --------------------------------------------------
-        # PASTAS PADRÃO QUE NÃO EXISTEM
-        # --------------------------------------------------
-
         faltantes = [
             nome
             for nome in PASTAS_PADRAO
-            if nome not in nomes_existentes
+            if nome not in nomes
         ]
 
-        for nome_padrao in faltantes:
+        for nome in faltantes:
 
             item = QTreeWidgetItem(
                 projeto_item
@@ -758,7 +1077,7 @@ class GerenciadorPastas(QMainWindow):
 
             item.setText(
                 0,
-                nome_padrao,
+                nome,
             )
 
             item.setText(
@@ -766,20 +1085,9 @@ class GerenciadorPastas(QMainWindow):
                 "AUSENTE",
             )
 
-            item.setText(
-                2,
-                "—",
-            )
-
-            item.setText(
-                3,
-                "—",
-            )
-
-            item.setText(
-                4,
-                "—",
-            )
+            item.setText(2, "—")
+            item.setText(3, "—")
+            item.setText(4, "—")
 
             item.setForeground(
                 0,
@@ -804,10 +1112,12 @@ class GerenciadorPastas(QMainWindow):
             btn.clicked.connect(
                 lambda checked=False,
                 projeto=projeto,
-                nome=nome_padrao:
+                nome=nome,
+                projeto_item=projeto_item:
                 self.criar_pasta(
                     projeto,
                     nome,
+                    projeto_item,
                 )
             )
 
@@ -819,18 +1129,167 @@ class GerenciadorPastas(QMainWindow):
 
         return (
             corretas,
-            incorretas,
+            incoerentes,
             len(faltantes),
         )
 
     # ======================================================
-    # AÇÕES DA PASTA
+    # ATUALIZA SOMENTE UM PROJETO
+    # ======================================================
+
+    def atualizar_projeto_item(
+        self,
+        projeto_item,
+        projeto,
+    ):
+
+        estava_expandido = (
+            projeto_item.isExpanded()
+        )
+
+        item_selecionado = (
+            self.tree.currentItem()
+        )
+
+        caminho_selecionado = None
+
+        if item_selecionado:
+            caminho_selecionado = (
+                item_selecionado.data(
+                    0,
+                    Qt.UserRole,
+                )
+            )
+
+        scroll = (
+            self.tree.verticalScrollBar().value()
+        )
+
+        # limpa filhos
+        while projeto_item.childCount():
+            projeto_item.takeChild(0)
+
+        self.carregar_pastas_projeto(
+            projeto_item,
+            projeto,
+        )
+
+        projeto_item.setExpanded(
+            estava_expandido
+        )
+
+        # atualiza estatística projeto
+        projeto_item.setText(
+            2,
+            "..."
+        )
+        projeto_item.setText(
+            3,
+            "..."
+        )
+        projeto_item.setText(
+            4,
+            "..."
+        )
+
+        self.carregar_estatisticas(
+            projeto_item,
+            projeto,
+        )
+
+        # tenta restaurar seleção
+        if caminho_selecionado:
+
+            for i in range(
+                projeto_item.childCount()
+            ):
+
+                child = projeto_item.child(i)
+
+                if (
+                    child.data(
+                        0,
+                        Qt.UserRole,
+                    )
+                    == caminho_selecionado
+                ):
+                    self.tree.setCurrentItem(
+                        child
+                    )
+                    break
+
+        QTimer.singleShot(
+            0,
+            lambda:
+            self.tree.verticalScrollBar().setValue(
+                scroll
+            ),
+        )
+
+        self.atualizar_cards()
+
+    # ======================================================
+    # CARDS
+    # ======================================================
+
+    def atualizar_cards(self):
+
+        projetos = (
+            self.tree.topLevelItemCount()
+        )
+
+        corretas = 0
+        incoerentes = 0
+        ausentes = 0
+
+        for i in range(projetos):
+
+            projeto = (
+                self.tree.topLevelItem(i)
+            )
+
+            for j in range(
+                projeto.childCount()
+            ):
+
+                status = projeto.child(j).text(
+                    1
+                )
+
+                if status == "CORRETA":
+                    corretas += 1
+
+                elif status == "INCOERENTE":
+                    incoerentes += 1
+
+                elif status == "AUSENTE":
+                    ausentes += 1
+
+        self.lbl_projetos["valor"].setText(
+            str(projetos)
+        )
+
+        self.lbl_corretas["valor"].setText(
+            str(corretas)
+        )
+
+        self.lbl_incorretas["valor"].setText(
+            str(incoerentes)
+        )
+
+        self.lbl_ausentes["valor"].setText(
+            str(ausentes)
+        )
+
+    # ======================================================
+    # AÇÕES
     # ======================================================
 
     def adicionar_acoes_pasta(
         self,
         item,
         pasta,
+        projeto_item,
     ):
 
         widget = QWidget()
@@ -843,8 +1302,6 @@ class GerenciadorPastas(QMainWindow):
             2,
             2,
         )
-
-        layout.setSpacing(5)
 
         btn_abrir = QPushButton(
             "Abrir"
@@ -869,19 +1326,23 @@ class GerenciadorPastas(QMainWindow):
             btn_padronizar
         )
 
-        for nome_padrao in PASTAS_PADRAO:
+        for nome in PASTAS_PADRAO:
 
-            acao = menu.addAction(
-                nome_padrao
+            action = menu.addAction(
+                nome
             )
 
-            acao.triggered.connect(
+            action.triggered.connect(
                 lambda checked=False,
                 origem=pasta,
-                destino=nome_padrao:
+                destino=nome,
+                tree_item=item,
+                projeto_item=projeto_item:
                 self.renomear_pasta(
                     origem,
                     destino,
+                    tree_item,
+                    projeto_item,
                 )
             )
 
@@ -904,29 +1365,32 @@ class GerenciadorPastas(QMainWindow):
         )
 
     # ======================================================
-    # MENU DE ADICIONAR
+    # MENU ADICIONAR
     # ======================================================
 
     def criar_menu_adicionar(
         self,
         projeto,
+        projeto_item,
     ):
 
         menu = QMenu(self)
 
         for nome in PASTAS_PADRAO:
 
-            acao = menu.addAction(
+            action = menu.addAction(
                 nome
             )
 
-            acao.triggered.connect(
+            action.triggered.connect(
                 lambda checked=False,
-                p=projeto,
-                n=nome:
+                projeto=projeto,
+                nome=nome,
+                projeto_item=projeto_item:
                 self.criar_pasta(
-                    p,
-                    n,
+                    projeto,
+                    nome,
+                    projeto_item,
                 )
             )
 
@@ -940,50 +1404,41 @@ class GerenciadorPastas(QMainWindow):
         self,
         projeto,
         nome,
+        projeto_item,
     ):
 
-        destino = projeto / nome
+        destino = (
+            Path(projeto)
+            / nome
+        )
 
         if destino.exists():
 
-            QMessageBox.information(
-                self,
-                "Pasta existente",
-                (
-                    "Essa pasta já existe no projeto:\n\n"
-                    f"{nome}"
-                ),
+            self.mostrar_toast(
+                f"{nome} já existe.",
+                "aviso",
             )
 
             return
 
         try:
+            destino.mkdir()
 
-            destino.mkdir(
-                parents=False,
-                exist_ok=False,
+            self.atualizar_projeto_item(
+                projeto_item,
+                Path(projeto),
             )
 
-            QMessageBox.information(
-                self,
-                "Pasta criada",
-                (
-                    "Pasta criada com sucesso:\n\n"
-                    f"{nome}"
-                ),
+            self.mostrar_toast(
+                f"Pasta criada: {nome}",
+                "sucesso",
             )
-
-            self.carregar_projetos()
 
         except Exception as erro:
 
-            QMessageBox.critical(
-                self,
-                "Erro",
-                (
-                    "Não foi possível criar a pasta.\n\n"
-                    f"{erro}"
-                ),
+            self.mostrar_toast(
+                f"Erro ao criar pasta: {erro}",
+                "erro",
             )
 
     # ======================================================
@@ -994,69 +1449,111 @@ class GerenciadorPastas(QMainWindow):
         self,
         origem,
         novo_nome,
+        tree_item,
+        projeto_item,
     ):
 
         origem = Path(origem)
 
         if not origem.exists():
 
-            QMessageBox.warning(
-                self,
-                "Pasta não encontrada",
-                (
-                    "A pasta de origem não existe mais.\n\n"
-                    f"{origem}"
-                ),
+            self.mostrar_toast(
+                "A pasta não existe mais.",
+                "erro",
             )
-
-            self.carregar_projetos()
 
             return
 
         if origem.name == novo_nome:
+
+            self.mostrar_toast(
+                "A pasta já possui esse nome.",
+                "info",
+            )
+
             return
 
-        destino = origem.parent / novo_nome
+        destino = (
+            origem.parent
+            / novo_nome
+        )
 
-        # --------------------------------------------------
-        # DESTINO NÃO EXISTE
-        # --------------------------------------------------
+        # ----------------------------------------
+        # RENOMEAÇÃO SIMPLES
+        # ----------------------------------------
 
         if not destino.exists():
 
             try:
-
                 origem.rename(
                     destino
                 )
 
-                self.carregar_projetos()
+                # ATUALIZA IMEDIATAMENTE O ITEM
+                tree_item.setText(
+                    0,
+                    novo_nome,
+                )
+
+                tree_item.setText(
+                    1,
+                    "CORRETA",
+                )
+
+                tree_item.setForeground(
+                    0,
+                    QColor(COR_OK),
+                )
+
+                tree_item.setForeground(
+                    1,
+                    QColor(COR_OK),
+                )
+
+                tree_item.setData(
+                    0,
+                    Qt.UserRole,
+                    str(destino),
+                )
+
+                # Recria os botões usando o novo caminho
+                self.adicionar_acoes_pasta(
+                    tree_item,
+                    destino,
+                    projeto_item,
+                )
+
+                # atualiza apenas os filhos deste projeto
+                self.atualizar_projeto_item(
+                    projeto_item,
+                    destino.parent,
+                )
+
+                self.mostrar_toast(
+                    f"Renomeada para {novo_nome}",
+                    "sucesso",
+                )
 
             except Exception as erro:
 
-                QMessageBox.critical(
-                    self,
-                    "Erro ao renomear",
-                    str(erro),
+                self.mostrar_toast(
+                    f"Erro ao renomear: {erro}",
+                    "erro",
                 )
 
             return
 
-        # --------------------------------------------------
+        # ----------------------------------------
         # DESTINO JÁ EXISTE
-        # --------------------------------------------------
+        # ----------------------------------------
 
         resposta = QMessageBox.question(
             self,
-            "Pasta já existe",
+            "Pasta já existente",
             (
-                f"A pasta padrão:\n\n"
-                f"{novo_nome}\n\n"
-                "já existe neste projeto.\n\n"
-                "Deseja MESCLAR o conteúdo da pasta atual "
-                "com a pasta existente?\n\n"
-                "Arquivos com o mesmo nome NÃO serão "
-                "sobrescritos automaticamente."
+                f"A pasta:\n\n{novo_nome}\n\n"
+                "já existe.\n\n"
+                "Deseja mesclar o conteúdo?"
             ),
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -1068,16 +1565,18 @@ class GerenciadorPastas(QMainWindow):
         self.mesclar_pastas(
             origem,
             destino,
+            projeto_item,
         )
 
     # ======================================================
-    # MESCLAR PASTAS
+    # MESCLAGEM
     # ======================================================
 
     def mesclar_pastas(
         self,
         origem,
         destino,
+        projeto_item,
     ):
 
         conflitos = []
@@ -1089,12 +1588,9 @@ class GerenciadorPastas(QMainWindow):
             ):
 
                 destino_item = (
-                    destino / item.name
+                    destino
+                    / item.name
                 )
-
-                # ------------------------------------------
-                # NÃO EXISTE NO DESTINO
-                # ------------------------------------------
 
                 if not destino_item.exists():
 
@@ -1103,13 +1599,7 @@ class GerenciadorPastas(QMainWindow):
                         str(destino_item),
                     )
 
-                    continue
-
-                # ------------------------------------------
-                # DUAS PASTAS
-                # ------------------------------------------
-
-                if (
+                elif (
                     item.is_dir()
                     and destino_item.is_dir()
                 ):
@@ -1120,68 +1610,49 @@ class GerenciadorPastas(QMainWindow):
                         conflitos,
                     )
 
-                # ------------------------------------------
-                # ARQUIVO COM MESMO NOME
-                # ------------------------------------------
-
                 else:
 
                     conflitos.append(
                         str(item)
                     )
 
-            # Remove origem apenas se ficou vazia
-
             try:
                 if not any(
                     origem.iterdir()
                 ):
                     origem.rmdir()
+
             except Exception:
                 pass
 
+            self.atualizar_projeto_item(
+                projeto_item,
+                destino.parent,
+            )
+
             if conflitos:
 
-                QMessageBox.warning(
-                    self,
-                    "Mesclagem concluída com conflitos",
+                self.mostrar_toast(
                     (
-                        "A maior parte do conteúdo foi "
-                        "mesclada.\n\n"
-                        f"{len(conflitos)} arquivo(s) ou "
-                        "item(ns) não foram movidos porque "
-                        "já existiam no destino.\n\n"
-                        "A pasta original foi mantida caso "
-                        "ainda contenha esses arquivos."
+                        f"Mesclado com "
+                        f"{len(conflitos)} conflito(s)."
                     ),
+                    "aviso",
                 )
 
             else:
 
-                QMessageBox.information(
-                    self,
-                    "Mesclagem concluída",
-                    (
-                        "As pastas foram mescladas "
-                        "com sucesso."
-                    ),
+                self.mostrar_toast(
+                    "Pastas mescladas com sucesso.",
+                    "sucesso",
                 )
-
-            self.carregar_projetos()
 
         except Exception as erro:
 
-            QMessageBox.critical(
-                self,
-                "Erro na mesclagem",
-                (
-                    "Não foi possível concluir "
-                    "a mesclagem.\n\n"
-                    f"{erro}"
-                ),
+            self.mostrar_toast(
+                f"Erro na mesclagem: {erro}",
+                "erro",
             )
-
-            self.carregar_projetos()
 
     def mesclar_diretorio_recursivo(
         self,
@@ -1199,7 +1670,10 @@ class GerenciadorPastas(QMainWindow):
             origem.iterdir()
         ):
 
-            alvo = destino / item.name
+            alvo = (
+                destino
+                / item.name
+            )
 
             if not alvo.exists():
 
@@ -1260,29 +1734,49 @@ class GerenciadorPastas(QMainWindow):
     def estatisticas_finalizadas(
         self,
         item,
+        caminho_original,
         arquivos,
         subpastas,
         tamanho,
     ):
 
-        # O item pode ter sido removido se a árvore
-        # foi recarregada enquanto a thread trabalhava.
-
         try:
+
+            # Impede thread antiga de atualizar
+            # um item que já mudou de caminho.
+            caminho_atual = item.data(
+                0,
+                Qt.UserRole,
+            )
+
+            if (
+                caminho_atual
+                and caminho_atual
+                != caminho_original
+            ):
+                return
 
             item.setText(
                 2,
-                f"{arquivos:,}".replace(",", "."),
+                f"{arquivos:,}".replace(
+                    ",",
+                    ".",
+                ),
             )
 
             item.setText(
                 3,
-                f"{subpastas:,}".replace(",", "."),
+                f"{subpastas:,}".replace(
+                    ",",
+                    ".",
+                ),
             )
 
             item.setText(
                 4,
-                formatar_tamanho(tamanho),
+                formatar_tamanho(
+                    tamanho
+                ),
             )
 
         except RuntimeError:
@@ -1297,40 +1791,51 @@ class GerenciadorPastas(QMainWindow):
         texto,
     ):
 
-        texto = texto.lower().strip()
+        texto = (
+            texto.lower().strip()
+        )
 
         for i in range(
             self.tree.topLevelItemCount()
         ):
 
-            item = self.tree.topLevelItem(i)
+            item = (
+                self.tree.topLevelItem(i)
+            )
 
-            nome = item.text(
-                0
-            ).lower()
+            nome = (
+                item.text(0).lower()
+            )
 
-            visivel = (
+            mostrar = (
                 not texto
                 or texto in nome
             )
 
             item.setHidden(
-                not visivel
+                not mostrar
             )
 
-            if texto and visivel:
-                item.setExpanded(True)
+            if (
+                texto
+                and mostrar
+            ):
+                item.setExpanded(
+                    True
+                )
 
     # ======================================================
-    # SELEÇÃO DA PASTA
+    # PASTA MÃE
     # ======================================================
 
     def selecionar_pasta_mae(self):
 
-        pasta = QFileDialog.getExistingDirectory(
-            self,
-            "Selecionar pasta mãe dos projetos",
-            str(self.pasta_mae),
+        pasta = (
+            QFileDialog.getExistingDirectory(
+                self,
+                "Selecionar pasta mãe",
+                str(self.pasta_mae),
+            )
         )
 
         if not pasta:
@@ -1344,7 +1849,9 @@ class GerenciadorPastas(QMainWindow):
             pasta
         )
 
-        self.carregar_projetos()
+        self.carregar_projetos(
+            exibir_toast=True
+        )
 
     # ======================================================
     # DUPLO CLIQUE
@@ -1408,7 +1915,6 @@ class GerenciadorPastas(QMainWindow):
 
             #subtitulo {{
                 color: {COR_TEXTO_SECUNDARIO};
-                font-size: 10pt;
             }}
 
             #card {{
@@ -1446,11 +1952,6 @@ class GerenciadorPastas(QMainWindow):
                 background-color: #292929;
             }}
 
-            QPushButton:pressed,
-            QToolButton:pressed {{
-                background-color: #333333;
-            }}
-
             #btnPrincipal {{
                 background-color: {COR_DOURADO};
                 color: #111111;
@@ -1460,7 +1961,6 @@ class GerenciadorPastas(QMainWindow):
 
             #btnPrincipal:hover {{
                 background-color: {COR_DOURADO_CLARO};
-                color: #111111;
             }}
 
             QLineEdit {{
@@ -1468,8 +1968,6 @@ class GerenciadorPastas(QMainWindow):
                 border: 1px solid {COR_BORDA};
                 border-radius: 6px;
                 padding: 8px;
-                selection-background-color: {COR_DOURADO};
-                selection-color: #111111;
             }}
 
             QLineEdit:focus {{
@@ -1478,20 +1976,18 @@ class GerenciadorPastas(QMainWindow):
 
             QTreeWidget {{
                 background-color: {COR_PAINEL};
-                alternate-background-color: #1C1C1C;
                 border: 1px solid {COR_BORDA};
                 border-radius: 8px;
                 outline: none;
             }}
 
             QTreeWidget::item {{
-                height: 36px;
+                height: 38px;
                 border-bottom: 1px solid #252525;
             }}
 
             QTreeWidget::item:selected {{
                 background-color: #3A321B;
-                color: white;
             }}
 
             QTreeWidget::item:hover {{
@@ -1527,7 +2023,6 @@ class GerenciadorPastas(QMainWindow):
             QScrollBar:vertical {{
                 background-color: #161616;
                 width: 12px;
-                margin: 0;
             }}
 
             QScrollBar::handle:vertical {{
@@ -1568,6 +2063,7 @@ def main():
     )
 
     janela = GerenciadorPastas()
+
     janela.show()
 
     sys.exit(
