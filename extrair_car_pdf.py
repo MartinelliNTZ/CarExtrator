@@ -23,7 +23,10 @@ O que ele faz, em ordem:
   5. Monta / atualiza o CSV "car_dados.csv" (mesma base do JSON: o número
      de linhas do CSV excluindo o cabeçalho é igual ao número de chaves do
      JSON);
-  6. No final imprime o resumo com nº de inserções, nº de atualizações e a
+  6. Classifica cada documento na coluna "classificacao_documento" do CSV
+     (ex.: "Recibo Nacional - GO", "Recibo SIMCAR - MT", "Demonstrativo
+     SICAR - MS", "Demonstrativo SIMCAR - MT", "Certificado Estadual - MS");
+  7. No final imprime o resumo com nº de inserções, nº de atualizações e a
      lista numerada de PDFs que deram falha.
 
 DEPENDÊNCIA (instalar uma única vez):
@@ -114,6 +117,13 @@ def extrair_texto_pdf(caminho: Path) -> str:
     if not texto.strip():
         raise RuntimeError("PDF sem camada de texto (parece ser imagem escaneada)")
     return _limpar_ligaduras(texto)
+
+
+_UF_SIGLAS = {
+    "AC", "AL", "AP", "AM", "BA", "CE", "DF", "ES", "GO", "MA",
+    "MT", "MS", "MG", "PA", "PB", "PR", "PE", "PI", "RJ", "RN",
+    "RS", "RO", "RR", "SC", "SP", "SE", "TO",
+}
 
 
 def _parece_codigo(token: str) -> bool:
@@ -477,12 +487,7 @@ def extrair_dados_demonstrativo(
 def _separar_propriedade_uf_municipio(bloco: str, numero_car: str):
     """Separa a tabela SIMCAR usando a UF do CAR, em uma ou várias linhas."""
     uf = numero_car[:2].upper()
-    ufs = {
-        "AC", "AL", "AP", "AM", "BA", "CE", "DF", "ES", "GO", "MA",
-        "MT", "MS", "MG", "PA", "PB", "PR", "PE", "PI", "RJ", "RN",
-        "RS", "RO", "RR", "SC", "SP", "SE", "TO",
-    }
-    if uf not in ufs:
+    if uf not in _UF_SIGLAS:
         return None
     texto = " ".join(bloco.split())
     # A última ocorrência da UF separa as colunas, preservando nomes que
@@ -1160,6 +1165,67 @@ def extrair_dados_car(texto: str, caminho_pdf: Path, numero_os: str = "") -> dic
         dados.setdefault(campo_novo, "")
     return _normalizar_campos(dados)
 # =====================================================================
+# 3.1) CLASSIFICAÇÃO DO CENÁRIO DO DOCUMENTO (coluna extra do CSV/JSON)
+# =====================================================================
+# Mapeia o 'tipo_documento' detectado para (família, sistema) do documento.
+_CLASSIFICACAO_POR_TIPO = {
+    "Recibo de Inscrição": ("Recibo", "Nacional"),
+    "Recibo de Inscrição CAR-estadual (SIMCAR)": ("Recibo", "SIMCAR"),
+    "Demonstrativo CAR": ("Demonstrativo", "SICAR"),
+    "Demonstrativo CAR-estadual (SIMCAR)": ("Demonstrativo", "SIMCAR"),
+    "Certificado de Inscrição CAR-estadual": ("Certificado", "Estadual"),
+}
+
+
+def _uf_do_registro(dados: dict) -> str:
+    """UF do registro: o campo 'uf' e, se estiver vazio, o prefixo do nº do CAR."""
+    uf = str(dados.get("uf") or "").strip().upper()
+    if uf in _UF_SIGLAS:
+        return uf
+    m = re.match(r"([A-Za-z]{2})\s*[-_]", str(dados.get("numero_do_car") or ""))
+    if m and m.group(1).upper() in _UF_SIGLAS:
+        return m.group(1).upper()
+    return ""
+
+
+def classificar_documento(dados: dict) -> str:
+    """Rótulo do CENÁRIO do documento de origem: família + sistema + UF.
+
+    O mesmo CAR pode ser comprovado por PDFs de origens diferentes (portal
+    federal, portal estadual, certificado), então a coluna identifica de
+    imediato qual delas gerou o registro. Exemplos:
+      - "Recibo Nacional - GO"      (recibo de inscrição nacional);
+      - "Recibo SIMCAR - MT"        (recibo estadual, ex.: SEMA-MT);
+      - "Demonstrativo SICAR - MS"  (consulta pública car.gov.br);
+      - "Demonstrativo SIMCAR - MT" (demonstrativo estadual, ex.: SEMA-MT);
+      - "Certificado Estadual - MS" (certificado de inscrição, ex.: IMASUL-MS).
+    """
+    tipo = str(dados.get("tipo_documento") or "").strip()
+    familia_sistema = _CLASSIFICACAO_POR_TIPO.get(tipo)
+    if familia_sistema is None:
+        # Tolerância a rótulos antigos/parciais gravados no JSON.
+        for rotulo, valor in _CLASSIFICACAO_POR_TIPO.items():
+            if rotulo.split()[0].lower() in tipo.lower():
+                familia_sistema = valor
+                break
+    uf = _uf_do_registro(dados)
+    if familia_sistema is None:
+        return (
+            f"Documento não identificado - {uf}" if uf
+            else "Documento não identificado"
+        )
+    familia, sistema = familia_sistema
+    return f"{familia} {sistema} - {uf}" if uf else f"{familia} {sistema}"
+
+
+def _aplicar_classificacao(base: dict) -> dict:
+    """Grava a classificação do cenário do documento em TODOS os registros."""
+    for registro in base.values():
+        registro["classificacao_documento"] = classificar_documento(registro)
+    return base
+
+
+# =====================================================================
 # 4) JSON: CARREGAR / SALVAR / BACKUP
 # =====================================================================
 def carregar_json() -> dict:
@@ -1206,7 +1272,8 @@ COLUNAS_CSV = [
     "numero_matricula", "data_documento_matricula",
     "livro_matricula", "folha_matricula", "municipio_cartorio",
     "diferenca_detectada", "area_documentacao_ha", "area_grafica_ha",
-    "tipo_documento", "situacao", "condicion", "aderiu_pra", "condicion_pra",
+    "tipo_documento", "classificacao_documento",
+    "situacao", "condicion", "aderiu_pra", "condicion_pra",
     "data_analise_car", "data_ultima_retificacao",
     "arquivo_pdf", "path_pdf", "criado_em", "atualizado_em",
 ]
@@ -1348,10 +1415,22 @@ def main() -> None:
             )
             chave = novo["numero_do_car"]
             chave_comparacao = _chave_car_comparacao(chave)
-            if eh_fgov and chave_comparacao in chaves_existentes:
-                preservados.append(nome_pdf)
-                print(f"[MANTIDO ] {nome_pdf}  (CAR já existe na base)")
-                continue
+            tipo_novo = novo.get("tipo_documento", "")
+            if chave_comparacao in chaves_existentes:
+                anterior = base.get(chaves_existentes[chave_comparacao]) or {}
+                tipo_anterior = anterior.get("tipo_documento", "")
+                # Preserva o registro já gravado quando o PDF atual é um
+                # demonstrativo e o registro existente veio de um RECIBO de
+                # inscrição: o recibo é o documento oficial e traz o nome do
+                # imóvel legível, enquanto os demonstrativos "_Atualizado"
+                # trazem o nome derivado do nome do arquivo (às vezes vazio).
+                if eh_fgov or (
+                    not tipo_novo.startswith("Recibo")
+                    and tipo_anterior.startswith("Recibo")
+                ):
+                    preservados.append(nome_pdf)
+                    print(f"[MANTIDO ] {nome_pdf}  (CAR já existe na base)")
+                    continue
             chave = chaves_existentes.get(chave_comparacao, chave)
             novo["numero_do_car"] = chave
             agora = agora_iso()
@@ -1388,6 +1467,9 @@ def main() -> None:
     for reg in base.values():
         for campo_novo in _CAMPOS_COMPATIVEIS:
             reg.setdefault(campo_novo, "")
+    # Classifica o CENÁRIO de cada documento (família + sistema + UF) em TODOS
+    # os registros, inclusive os que já existiam no JSON antes desta versão.
+    base = _aplicar_classificacao(base)
     salvar_json(base)
     try:
         n_filas = salvar_csv(base)
