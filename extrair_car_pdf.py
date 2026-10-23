@@ -29,6 +29,37 @@ O que ele faz, em ordem:
   7. No final imprime o resumo com nº de inserções, nº de atualizações e a
      lista numerada de PDFs que deram falha.
 
+COMO ELE IDENTIFICA O TIPO E LÊ CADA LAYOUT
+  O tipo do documento é identificado por ASSINATURAS DE CONTEÚDO (layout),
+  não só pelo nome do arquivo:
+    - Recibo Nacional (car.gov.br)           "RECIBO DE INSCRIÇÃO DO IMÓVEL RURAL NO CAR"
+    - Recibo SIMCAR (CAR Digital/estadual)   "Recibo de Inscrição do CAR Digital" / "Nº Recibo Federal"
+    - Demonstrativo SICAR (car.gov.br)       "Demonstrativo da Situação das Informações Declaradas"
+    - Demonstrativo SIMCAR (estadual)        "Demonstrativo de Informações no CAR"
+    - Certificado Estadual (SIMCAR)          "Certificado de Inscrição Número"
+  Quando o extrator não consegue definir o tipo, o layout detectado define a
+  classificação (campos "classificacao_documento" e "tipo_documento_fonte").
+
+  Cada campo é lido em DUAS OU TRÊS TENTATIVAS: primeiro o padrão do layout
+  mais comum; depois variações de rótulo e de quebra de linha (o texto é
+  achatado para casar rótulos partidos em duas linhas, como "Área do\nimóvel:"
+  e "Coordenadas\ncentroide:"); e por fim variações de tabela (ex.: o quadro
+  "Dados Gerais" do SIMCAR, cujos valores podem estar na mesma linha ou na
+  linha seguinte).
+
+CHAVE "pdf_bruto" (SOMENTE no JSON — não vai para o CSV)
+  Cada registro guarda o que foi lido do PDF, sem tratamento:
+    "paginas", "caracteres", "layout_detectado", "alertas",
+    "campos_nao_tratados" (rótulos cujo valor NÃO virou campo do schema) e
+    "texto" (texto integral extraído do PDF). Serve de matéria-prima para
+    conferir leituras incompletas e para criar novas regras de extração.
+
+PRECEDÊNCIA ENTRE PDFs DO MESMO CAR
+  Quando o mesmo CAR aparece em mais de um PDF, o RECIBO de inscrição
+  prevalece sobre demonstrativos (inclusive os "..._Atualizado"), porque é o
+  documento oficial e traz o nome do imóvel legível. Demonstrativos do FGOV
+  só completam CARs ainda ausentes na base.
+
 DEPENDÊNCIA (instalar uma única vez):
     python -m pip install pypdf
 
@@ -108,15 +139,20 @@ def _limpar_ligaduras(texto: str) -> str:
     return txt
 
 
-def extrair_texto_pdf(caminho: Path) -> str:
-    """Extrai o texto de todas as páginas do PDF."""
+def ler_pdf(caminho: Path) -> tuple:
+    """Lê o PDF inteiro e devolve (texto de todas as páginas, nº de páginas)."""
     with caminho.open("rb") as fh:
         leitor = PdfReader(fh)
         paginas = [pagina.extract_text() or "" for pagina in leitor.pages]
     texto = "\n".join(paginas)
     if not texto.strip():
         raise RuntimeError("PDF sem camada de texto (parece ser imagem escaneada)")
-    return _limpar_ligaduras(texto)
+    return _limpar_ligaduras(texto), len(paginas)
+
+
+def extrair_texto_pdf(caminho: Path) -> str:
+    """Extrai o texto de todas as páginas do PDF."""
+    return ler_pdf(caminho)[0]
 
 
 _UF_SIGLAS = {
@@ -249,43 +285,53 @@ def es_documento_car(texto: str) -> bool:
 
 
 def _nome_imovel_de_archivo(caminho_pdf: Path) -> str:
-    """Deriva el nombre del imóvel del nombre del archivo, si es posible.
+    """Deriva o nome do imóvel a partir do NOME DO ARQUIVO (último recurso).
 
-    Ejemplos:
-      01_FAZENDA ARIZONA.pdf              -> FAZENDA ARIZONA
-      02_01_FAZENDA TROPICAL.pdf           -> FAZENDA TROPICAL
-      02_02_SEDE TROPICAL.pdf              -> SEDE TROPICAL
-      03_02_FAZENDA PONTE DE PEDRA.pdf     -> FAZENDA PONTE DE PEDRA
-    Si el archivo sólo contiene un código (ej.: "Demonstrativo_MS-5005806-..."),
-    devuelve '' (no se debe usar el código como nombre de imóvel).
+    É usado apenas quando o PDF não traz o nome no texto — caso do
+    Demonstrativo do SICAR, que não declara o nome do imóvel. Antes, o nome
+    era DESCARTADO por inteiro quando o arquivo trazia o código do CAR
+    ("FAZ_02_Vera_Lucia_MS-5001243-..."); agora o código é REMOVIDO e a
+    parte descritiva é aproveitada:
+      01_FAZENDA ARIZONA.pdf                  -> FAZENDA ARIZONA
+      02_01_FAZENDA TROPICAL.pdf              -> FAZENDA TROPICAL
+      120 - Saco do Céu Demonstrativo_MS-...  -> Saco do Céu
+      FAZ_02_Vera_Lucia_MS-5001243-1806...    -> FAZ Vera Lucia
+      Demonstrativo_MS-5001003-329DD167...    -> "" (só código, sem nome)
+      Sicar - Sistema Nacional de Cadastro... -> "" (título genérico)
     """
     nome = caminho_pdf.stem
-    # Quita prefijos numéricos tipo "01_", "02_01-", "3 - "
+    # Remove o código do CAR (UF + 5+ dígitos) e tudo o que vier depois dele.
+    nome = re.sub(r"[_\- ]*[A-Z]{2}[-_ ]?\d{5,}.*$", "", nome, flags=re.IGNORECASE)
+    # Remove prefixos numéricos ("01_", "02_01-", "3 - ", "120 - ").
     nome = re.sub(r"^\s*\d+(?:[._\-]\s*\d+)*\s*[._\-]\s*", "", nome).strip()
-    # Quita prefijos genéricos: "Demonstrativo_", "Recibo", "Certificado",
-    # "CAR -", "RECIBO-CAR_", "CAR2SIMCAR", etc. Aplicado em laços porque um
-    # nome pode combinar vários prefixos (ex.: "RECIBO-CAR_ITAGUASSU.pdf").
-    for _ in range(3):
-        nome = re.sub(
-            r"(?i)^(demonstrativo|recibo|certificado|comprovante|consulta|car|simcar)"
-            r"\s*[_\-\s]+\s*",
-            "",
-            nome,
-        ).strip()
-    nome = re.sub(r"(?i)\s*[-_]?\s*CAR\s*$", "", nome).strip()
-    # Se o resultado parece código (ex.: "MS-5005806-E038..." ou "PI-2208908-...").
-    # Detecta antes da normalização códigos "UF-dígitos"; depois da normalização
-    # rejeita apenas strings tipo identificador (dígitos/separadores), mantendo
-    # nomes alfabéticos válidos (ex.: "CRISTO REI", "ITAGUASSU", "OURO E PRATA").
-    if re.search(r"\b[A-Z]{2}[-_]\d{5,}\b", nome):
+    # Troca separadores por espaço ANTES de remover as palavras de documento:
+    # em "_Demonstrativo" não existe fronteira de palavra (o "_" é caractere
+    # de palavra), então a remoção só funciona depois da troca.
+    nome = re.sub(r"[_\-]+", " ", nome)
+    # Remove palavras que nomeiam o DOCUMENTO, não o imóvel.
+    nome = re.sub(
+        r"(?i)\b(demonstrativo|recibo|certificado|comprovante|consulta|"
+        r"atualizado|sicar|simcar|car|os)\b",
+        " ",
+        nome,
+    )
+    nome = re.sub(r"^\s*(?:\d+\s+)+", "", nome)      # números soltos à esquerda
+    nome = re.sub(r"(?i)\b(FAZ|FZ)\s+\d{1,4}\b", r"\1", nome)
+    nome = re.sub(r"\s+", " ", nome).strip(" .-")
+    if not nome or len(nome.split()) > 12:
         return ""
-    nombre = re.sub(r"[_\-\s]+", " ", nome).strip()
-    if re.fullmatch(r"[A-Z0-9._\-]{8,}", nombre) and re.search(r"[\d._\-]", nombre):
+    # Título genérico de documento (não é nome de imóvel).
+    if re.search(
+        r"(?i)(sistema nacional|cadastro ambiental rural|consulta p[úu]blica)",
+        nome,
+    ):
         return ""
-    # Fallback adicional: ainda parece código (número com muitos dígitos)
-    if re.search(r"\b[A-Z]{2}\s+\d{5,}\b", nombre) or re.search(r"\d{6,}", nombre):
+    # Código/identificador (um só token com dígitos): não é nome.
+    if re.fullmatch(r"[A-Za-z0-9._\-]{10,}", nome) or re.search(r"\d{6,}", nome):
         return ""
-    return nombre
+    if not re.search(r"[A-Za-zÀ-ÿ]{3}", nome):
+        return ""
+    return nome
 
 
 def extrair_dados_demonstrativo(
@@ -308,6 +354,7 @@ def extrair_dados_demonstrativo(
     dados["numero_do_car"] = re.sub(r"\s+", "", m.group(1))
 
     dados["nome_imovel"] = _nome_imovel_de_archivo(caminho_pdf)
+    dados["nome_imovel_fonte"] = "nome do arquivo" if dados["nome_imovel"] else ""
 
     # Município/UF: formatos possíveis:
     #   antigo: "Município: Nioaque Unidade da Federação: MS" (mesma linha) ou
@@ -475,6 +522,95 @@ def extrair_dados_demonstrativo(
             if dados["area_reserva_legal_proposta_ha"] not in ("", "-")
             else dados["area_reserva_legal_exigida_ha"]
         )
+    # ---- 2ª OPORTUNIDADE DE LEITURA -------------------------------------
+    # O Demonstrativo do SICAR tem DUAS gerações de layout: a nova (2024+)
+    # e a antiga, em que rótulo e valor caem em linhas diferentes
+    # ("Área do\nimóvel:\n586,44 ha", "Coordenadas\ncentroide:\nLat: ...") e
+    # os rótulos mudam de nome ("Situação cadastro", "Data de registro no
+    # SiCAR", "Condição cadastro"). Aqui só preenchemos o que ficou VAZIO,
+    # sem tocar no que a 1ª leitura já trouxe.
+    plano = _texto_plano(texto)
+    if not dados.get("municipio") or not dados.get("uf"):
+        m = re.search(
+            r"Munic[ií]pio\s*/\s*UF\s*:\s*([^(]+?)\s*\(\s*([A-Z]{2})\s*\)",
+            plano,
+        )
+        if m:
+            dados["municipio"] = dados.get("municipio") or m.group(1).strip()
+            dados["uf"] = dados.get("uf") or m.group(2)
+    if not dados.get("latitude") or not dados.get("longitude"):
+        m = re.search(
+            r"Lat:\s*(\d[^A-Za-z]*?[NSO])\s+Long:\s*(\d[^A-Za-z]*?[NSO])",
+            plano,
+        )
+        if m:
+            dados["latitude"] = dados.get("latitude") or m.group(1).strip()
+            dados["longitude"] = dados.get("longitude") or m.group(2).strip()
+    if not dados.get("situacao"):
+        candidato = _campo_plano(
+            texto,
+            r"Situa[çc][ãa]o\s*(?:do\s*)?[Cc]adastro\s*:\s*"
+            r"([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ ]{0,40}?)(?=\s+[A-ZÀ-Ý]|$)",
+        )
+        # No layout antigo o rótulo vem SEM valor e a captura pega o rótulo
+        # seguinte ("Registro no CAR: ...") — isso não é situação do cadastro.
+        if candidato and not re.search(r"(?i)registro|car\b", candidato):
+            dados["situacao"] = candidato
+    if not dados.get("situacao"):
+        # Situação declarada em linha isolada no topo do documento.
+        m = re.search(
+            r"(?im)^[ \t]*(Ativo|Pendente|Cancelado|Suspenso|Indeferido|"
+            r"Aguardando an[áa]lise)[ \t]*$",
+            texto,
+        )
+        if m:
+            dados["situacao"] = m.group(1)
+    if not dados.get("condicion"):
+        dados["condicion"] = _campo_plano(
+            texto,
+            r"Condi[çc][ãa]o\s*(?:Externa|cadastro)\s*:\s*"
+            r"([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ, ]{0,60}?)(?=\s+[A-ZÀ-Ý]|$)",
+        )
+    if not dados.get("aderiu_pra"):
+        dados["aderiu_pra"] = _campo_plano(
+            texto,
+            r"Aderiu ao Programa de Regulariza[çc][ãa]o\s*Ambiental\s*:\s*"
+            r"([A-Za-zÀ-ÿ]{2,5})(?=\s|$)",
+        )
+    if not dados.get("data_cadastro"):
+        dados["data_cadastro"] = _campo_plano(
+            texto,
+            r"(?:Data de Cadastro|Data da Inscri[çc][ãa]o|Data de Inscrição"
+            r"|Data de registro no SiCAR)\s*:?\s*(\d{1,2}/\d{1,2}/\d{4})",
+        )
+    if not dados.get("data_analise_car"):
+        dados["data_analise_car"] = _campo_plano(
+            texto, r"Data da an[áa]lise do CAR\s*:?\s*(\d{1,2}/\d{1,2}/\d{4})"
+        )
+    if not dados.get("data_ultima_retificacao"):
+        dados["data_ultima_retificacao"] = _campo_plano(
+            texto,
+            r"Data da [UuúÚ]ltima [Rr]etifica[çc][ãa]o\s*:?\s*"
+            r"(\d{1,2}/\d{1,2}/\d{4})",
+        )
+    if not dados.get("area_total_ha"):
+        dados["area_total_ha"] = _valor_plano(
+            texto, "Área do Imóvel Rural", "Área do imóvel",
+            "Área Total do Imóvel",
+        )
+        for campo in ("area_total_imovel_ha", "area_liquida_imovel_ha"):
+            dados[campo] = dados.get(campo) or dados["area_total_ha"]
+    if not dados.get("area_uso_restrito_ha"):
+        dados["area_uso_restrito_ha"] = _valor_plano(
+            texto, "Área de uso restrito", "Áreas de Uso Restrito"
+        )
+    if not dados.get("area_reserva_legal_ha"):
+        dados["area_reserva_legal_ha"] = _valor_plano(
+            texto,
+            "Total de Reserva Legal Declarada pelo Proprietário/Possuidor",
+            "Total de reserva legal declarada pelo proprietário/possuidor",
+        )
+
     for campo_novo in (
         "area_total_documentada_ha", "area_reserva_legal_exigida_ha",
         "area_reserva_legal_existente_ha", "area_reserva_legal_proposta_ha",
@@ -554,7 +690,13 @@ def extrair_dados_recibo_simcar_mt(
                 dados["nome_imovel"] = " ".join(" ".join(linhas).split())
     else:
         dados["nome_imovel"] = _nome_imovel_de_archivo(caminho_pdf)
+        dados["nome_imovel_fonte"] = (
+            "nome do arquivo" if dados["nome_imovel"] else ""
+        )
     dados.setdefault("nome_imovel", "")
+    dados.setdefault("nome_imovel_fonte", "")
+    if dados["nome_imovel"] and not dados["nome_imovel_fonte"]:
+        dados["nome_imovel_fonte"] = "texto do PDF"
     dados.setdefault("municipio", "")
 
     # ---------- Dados Gerais: nº estadual, situação, datas -------------------
@@ -562,17 +704,38 @@ def extrair_dados_recibo_simcar_mt(
     dados["data_situacao"] = ""
     dados["situacao"] = ""
     dados["data_cadastro"] = ""
+    # O quadro "Dados Gerais" tem DUAS variações de layout:
+    #   1) valores na MESMA linha: "MT32218/2018 Ativo 05/06/2025 05/06/2025";
+    #   2) valores na linha SEGUINTE (CAR Digital 2025):
+    #      "Nº CAR Estadual Situação Estadual Tipo" / "MT27526/2019 Ativo
+    #      Digital" / "Data de Cadastro Data da Situação" / datas.
+    # Em vez de um regex por layout, isola-se o QUADRO entre "Dados Gerais"
+    # e "Nº Recibo Federal" e dele saem o nº do CAR, a situação e as datas.
+    quadro = ""
     m = re.search(
-        r"\n\s*([A-Z]{2}\d+/\d{4})\s+(.+?)\s+(\d{1,2}/\d{1,2}/\d{4})\s+"
-        r"(\d{1,2}/\d{1,2}/\d{4})\s*\n",
-        txt,
+        r"Dados Gerais\s*\n(.*?)\n\s*N[º°]\s*Recibo Federal", txt, re.DOTALL
     )
+    if not m:
+        m = re.search(
+            r"Dados Gerais\s*\n(.*?)\n\s*Dados da Propriedade", txt, re.DOTALL
+        )
+    if m:
+        quadro = m.group(1)
+    m = re.search(r"([A-Z]{2}\d+/\d{4})", quadro)
     if m:
         dados["numero_car_estadual"] = m.group(1)
-        dados["situacao"] = m.group(2).strip()
-        dados["data_cadastro"] = m.group(3)
-        dados["data_situacao"] = m.group(4)
-    else:
+        m_sit = re.match(
+            r"\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ ]*?)\s*(?:\n|$|\d{2}/\d{2}/\d{4})",
+            quadro[m.end():],
+        )
+        if m_sit:
+            dados["situacao"] = re.sub(r"\s+", " ", m_sit.group(1)).strip()
+    datas = re.findall(r"\d{1,2}/\d{1,2}/\d{4}", quadro)
+    if datas:
+        dados["data_cadastro"] = datas[0]
+    if len(datas) > 1:
+        dados["data_situacao"] = datas[1]
+    if not dados["numero_car_estadual"]:
         m = re.search(r"N[º°]\s*CAR Estadual\s*\n?\s*([A-Z]{2}\d+/\d{4})", txt)
         if m:
             dados["numero_car_estadual"] = m.group(1)
@@ -624,7 +787,7 @@ def extrair_dados_recibo_simcar_mt(
     dados["area_total_ha"] = area_total
     dados["area_total_documentada_ha"] = ""
     dados["remanescente_vegetacao_nativa_ha"] = _valor_tras_label(
-        txt, "Área de Vegetação Nativa"
+        txt, "Área de Vegetação Nativa", "Área de Vegetação Nativa Preservada"
     )
     dados["area_app_ha"] = _valor_tras_label(
         txt, "Área de Preservação Permanente"
@@ -633,6 +796,10 @@ def extrair_dados_recibo_simcar_mt(
     dados["area_liquida_imovel_ha"] = area_total
     auas = _valor_tras_label(txt, "Área de Uso Antropizado do Solo")
     area_rl_nativa = _valor_tras_label(txt, "Área de Reserva Legal Nativa")
+    if not area_rl_nativa:
+        # Layout CAR Digital 2025: o quadro "Dados de Reserva Legal" usa
+        # "ARL Preservada" em vez de "Área de Reserva Legal Nativa".
+        area_rl_nativa = _valor_tras_label(txt, "ARL Preservada")
 
     for campo in (
         "area_reserva_legal_ha", "area_reserva_legal_exigida_ha",
@@ -644,6 +811,16 @@ def extrair_dados_recibo_simcar_mt(
         "latitude", "longitude", "diferenca_detectada",
     ):
         dados[campo] = ""
+    # Uso restrito: no SIMCAR o rótulo vem com sufixo na mesma linha
+    # ("Área de Uso Restrito - AUR Pantaneira 0,0000"), então o valor não fica
+    # colado ao rótulo e o padrão normal não o encontra.
+    m_uso = re.search(
+        r"Área de Uso Restrito[^\n]*?([\d.,]+)\s*$",
+        txt,
+        re.MULTILINE | re.IGNORECASE,
+    )
+    if m_uso:
+        dados["area_uso_restrito_ha"] = m_uso.group(1)
     # Reserva Legal Nativa (ARLN no croqui / quadro geral do SIMCAR)
     if area_rl_nativa:
         dados["area_reserva_legal_ha"] = area_rl_nativa
@@ -663,6 +840,14 @@ def extrair_dados_recibo_simcar_mt(
             mm = re.match(
                 r"^\s*([\d.\-]+)\s+([A-Za-zÀ-ÿ]+)\s+([\d.,]+)\s*$", linha
             )
+            if not mm:
+                # Layout "Documento | Tipo | Área (ha)" (CAR Digital 2025):
+                # ex.: "Certidão de registro: 19.631 Matrícula 2.359,4276"
+                mm = re.match(
+                    r"^\s*(?:[^:]*:\s*)?([\d.\-/]+)\s+"
+                    r"([A-Za-zÀ-ÿ]+)\s+([\d.,]+)\s*$",
+                    linha,
+                )
             if mm:
                 matriculas.append({
                     "numero": mm.group(1),
@@ -774,6 +959,27 @@ def _valor_tras_label(texto: str, *labels) -> str:
         if m:
             return m.group(1)
     return ""
+
+
+def _texto_plano(texto: str) -> str:
+    """Devolve o texto em UMA linha só (quebras de linha viram espaço).
+
+    Vários layouts quebram rótulo e valor em linhas diferentes — ex.:
+      'Área do\nimóvel:\n586,44 ha' e 'Coordenadas\ncentroide:\nLat: ...'
+    Achatando o texto, os padrões voltam a casar sem um regex por variação.
+    """
+    return re.sub(r"\s+", " ", texto).strip()
+
+
+def _campo_plano(texto: str, padrao: str) -> str:
+    """Como _campo_linea, mas busca no texto ACHATADO (tolerante a quebras)."""
+    m = re.search(padrao, _texto_plano(texto))
+    return m.group(1).strip() if m else ""
+
+
+def _valor_plano(texto: str, *labels) -> str:
+    """Como _valor_tras_label, mas busca no texto ACHATADO."""
+    return _valor_tras_label(_texto_plano(texto), *labels)
 
 
 def _normalizar_campos(dados: dict) -> dict:
@@ -914,6 +1120,7 @@ def _enriquecer_nombres(base: dict) -> dict:
                 continue
             if abs(lat - lat2) < 0.001 and abs(lon - lon2) < 0.001:
                 v["nome_imovel"] = v2["nome_imovel"]
+                v["nome_imovel_fonte"] = "registro irmão (mesmo centróide)"
                 break
     return base
 
@@ -947,6 +1154,7 @@ def extrair_dados_certificado_ms(
     dados["nome_imovel"] = m.group(1).strip() if m else _nome_imovel_de_archivo(
         caminho_pdf
     )
+    dados["nome_imovel_fonte"] = "texto do PDF" if m else "nome do arquivo"
 
     dados["municipio"] = ""
     m = re.search(r"DADOS GERAIS\s*\n[^\n]+\n[^\n]+\n([^\n]+)", txt, re.IGNORECASE)
@@ -1097,6 +1305,7 @@ def extrair_dados_car(texto: str, caminho_pdf: Path, numero_os: str = "") -> dic
     # Nome do imóvel pode ocupar várias linhas -> captura até "Município:"
     m = re.search(r"Nome do Imóvel Rural:\s*(.*?)\n\s*Município:", texto, re.DOTALL)
     dados["nome_imovel"] = " ".join(m.group(1).split()) if m else ""
+    dados["nome_imovel_fonte"] = "texto do PDF" if m else ""
 
     m = re.search(r"Município:\s*([^\n]+?)\s+UF:\s*([^\n]+)", texto)
     dados["municipio"] = m.group(1).strip() if m else ""
@@ -1219,9 +1428,215 @@ def classificar_documento(dados: dict) -> str:
 
 
 def _aplicar_classificacao(base: dict) -> dict:
-    """Grava a classificação do cenário do documento em TODOS os registros."""
+    """Grava a classificação do cenário do documento em TODOS os registros.
+
+    Usa o arsenal de leitura crua como SEGUNDA OPINIÃO: se o tipo do
+    documento não foi definido pelo extrator (ou é desconhecido), o layout
+    detectado pelas assinaturas de conteúdo define o tipo — assim nenhum
+    registro fica sem classificação.
+    """
     for registro in base.values():
+        tipo = str(registro.get("tipo_documento") or "").strip()
+        layout = (registro.get("pdf_bruto") or {}).get("layout_detectado", "")
+        tipo_layout = _LAYOUT_PARA_TIPO.get(layout, "")
+        if tipo not in _CLASSIFICACAO_POR_TIPO and tipo_layout:
+            registro["tipo_documento"] = tipo_layout
+            registro["tipo_documento_fonte"] = "layout do PDF (assinaturas)"
+        else:
+            registro["tipo_documento_fonte"] = "extrator do PDF"
         registro["classificacao_documento"] = classificar_documento(registro)
+    return base
+
+
+# =====================================================================
+# 3.2) LEITURA CRUA DO PDF: layout, campos não tratados e alertas
+# =====================================================================
+# Assinaturas de conteúdo que identificam o LAYOUT/portal que gerou o PDF.
+_LAYOUT_ASSINATURAS = (
+    ("Recibo Nacional (car.gov.br)",
+     ("RECIBO DE INSCRIÇÃO DO IMÓVEL RURAL NO CAR",)),
+    # O demonstrativo SIMCAR também traz "Nº Recibo Federal", por isso ele é
+    # testado ANTES do recibo SIMCAR (a assinatura mais específica primeiro).
+    ("Demonstrativo SIMCAR (estadual)",
+     ("Demonstrativo de Informações no CAR",)),
+    ("Recibo SIMCAR (CAR Digital)",
+     ("Recibo de Inscrição do CAR Digital",)),
+    ("Recibo SIMCAR (estadual)",
+     ("Nº Recibo Federal",)),
+    ("Demonstrativo SICAR (car.gov.br)",
+     ("Demonstrativo da Situação das Informações Declaradas",
+      "Sicar - Sistema Nacional de Cadastro Ambiental Rural")),
+    ("Certificado Estadual (SIMCAR)",
+     ("Certificado de Inscrição Número", "CADASTRO AMBIENTAL RURAL DO")),
+)
+
+# Layout detectado -> tipo_documento equivalente (completa a classificação
+# quando o extrator não conseguiu definir o tipo do documento).
+_LAYOUT_PARA_TIPO = {
+    "Recibo Nacional (car.gov.br)": "Recibo de Inscrição",
+    "Recibo SIMCAR (CAR Digital)":
+        "Recibo de Inscrição CAR-estadual (SIMCAR)",
+    "Recibo SIMCAR (estadual)":
+        "Recibo de Inscrição CAR-estadual (SIMCAR)",
+    "Demonstrativo SICAR (car.gov.br)": "Demonstrativo CAR",
+    "Demonstrativo SIMCAR (estadual)":
+        "Demonstrativo CAR-estadual (SIMCAR)",
+    "Certificado Estadual (SIMCAR)":
+        "Certificado de Inscrição CAR-estadual",
+}
+
+
+def detectar_layout(texto: str) -> str:
+    """Identifica o LAYOUT do PDF só por assinaturas de conteúdo.
+
+    É uma segunda opinião sobre o tipo do documento, independente do
+    extrator usado: preenche o tipo quando o extrator não o define e alerta
+    quando o texto não confirma o tipo escolhido.
+    """
+    for layout, assinaturas in _LAYOUT_ASSINATURAS:
+        for assinatura in assinaturas:
+            if assinatura in texto:
+                return layout
+    return ""
+
+
+def _assinatura_valor(valor) -> str:
+    """Assinatura normalizada de um valor (para comparar valores iguais)."""
+    return re.sub(r"[^0-9A-Za-zÀ-ÿ]+", "", str(valor)).lower()
+
+
+def _valores_usados(dados: dict) -> set:
+    """Assinaturas de TODOS os valores já aproveitados em campos do registro."""
+    usados = set()
+    for valor in dados.values():
+        if isinstance(valor, str):
+            usados.add(_assinatura_valor(valor))
+        elif isinstance(valor, list):
+            for item in valor:
+                if isinstance(item, dict):
+                    for sub in item.values():
+                        usados.add(_assinatura_valor(sub))
+    return usados
+
+
+def _extrair_campos_nao_tratados(texto: str, dados: dict) -> dict:
+    """Pares "rótulo -> valor" do PDF cujo valor NÃO foi aproveitado em nenhum
+    campo do registro — ou seja: informação lida e não tratada.
+
+    São duas varreduras complementares, porque os layouts misturam os dois
+    estilos de tabela:
+      (a) "rótulo: valor" — o texto é achatado e o valor é recortado ENTRE um
+          rótulo e o rótulo seguinte, o que preserva valores que o PDF quebra
+          em várias linhas ("Município: Sebastião Leal UF: Piauí");
+      (b) "rótulo valor" (sem dois-pontos) no FIM da linha — como nas tabelas
+          de áreas do SIMCAR ("Massa d'água 56,0643").
+    Um valor já aproveitado em algum campo (ou que seja pedaço de um valor
+    aproveitado) é descartado, em qualquer direção.
+    """
+    plano = _texto_plano(texto)
+    usados = _valores_usados(dados)
+
+    def ja_tratado(valor: str) -> bool:
+        assinatura = _assinatura_valor(valor)
+        if not assinatura:
+            return True
+        if assinatura in usados:
+            return True
+        return any(
+            u and len(u) >= 8 and (u in assinatura or assinatura in u)
+            for u in usados
+        )
+
+    achados = {}
+    # ---- (a) "rótulo: valor" -------------------------------------------
+    posicoes = list(re.finditer(
+        r"([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 /º°ª().\-]{2,60}?)\s*:", plano
+    ))
+    for i, m in enumerate(posicoes):
+        rotulo = re.sub(r"\s+", " ", m.group(1)).strip()
+        fim_valor = posicoes[i + 1].start() if i + 1 < len(posicoes) else len(plano)
+        valor = plano[m.end():fim_valor].strip(" .;-")
+        if not rotulo or not valor or len(valor) > 140:
+            continue
+        if len(rotulo.split()) > 9 or len(valor.split()) > 12:
+            continue
+        if ja_tratado(valor):
+            continue
+        achados.setdefault(rotulo, valor)
+        if len(achados) >= 120:
+            return achados
+    # ---- (b) "rótulo valor" no fim da linha ----------------------------
+    for linha in texto.splitlines():
+        m = re.match(
+            r"^\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 /º°ª().\-–]{3,60}?)\s+"
+            r"([\d.,]+)\s*(?:ha)?\s*$",
+            linha,
+        )
+        if not m:
+            continue
+        rotulo = re.sub(r"\s+", " ", m.group(1)).strip()
+        valor = m.group(2)
+        if rotulo in achados or len(rotulo.split()) > 9:
+            continue
+        if ja_tratado(valor):
+            continue
+        achados.setdefault(rotulo, valor)
+        if len(achados) >= 160:
+            break
+    return achados
+
+
+def _montar_pdf_bruto(texto: str, paginas: int, dados: dict) -> dict:
+    """Monta a chave 'pdf_bruto' (SOMENTE no JSON): tudo o que foi lido.
+
+    Guarda o texto integral do PDF, o layout detectado por assinaturas, os
+    pares rótulo/valor que NÃO foram aproveitados em nenhum campo do
+    registro e os alertas de leitura.
+    """
+    layout = detectar_layout(texto)
+    alertas = []
+    tipo = str(dados.get("tipo_documento") or "")
+    if layout and tipo and _LAYOUT_PARA_TIPO.get(layout, tipo) != tipo:
+        alertas.append(
+            f"layout do texto ({layout!r}) diverge do tipo extraído ({tipo!r})"
+        )
+    if not layout:
+        alertas.append("layout não reconhecido pelas assinaturas de conteúdo")
+    for campo, rotulo in (
+        ("numero_do_car", "registro do CAR"),
+        ("nome_imovel", "nome do imóvel"),
+        ("municipio", "município"),
+        ("uf", "UF"),
+        ("area_total_ha", "área total"),
+        ("latitude", "coordenadas"),
+    ):
+        if not dados.get(campo):
+            alertas.append(f"{rotulo} não encontrado no texto do PDF")
+    return {
+        "paginas": paginas,
+        "caracteres": len(texto),
+        "layout_detectado": layout,
+        "alertas": alertas,
+        "campos_nao_tratados": _extrair_campos_nao_tratados(texto, dados),
+        "texto": texto,
+    }
+
+
+def _marcar_fonte_nome(base: dict) -> dict:
+    """Registra de ONDE veio o nome do imóvel de cada registro.
+
+    Explica por que, dentro do MESMO tipo de documento, uns registros têm
+    'FAZENDA ...' e outros não: o nome pode vir do texto do PDF (oficial),
+    do nome do arquivo (estimativa) ou de um registro irmão do mesmo
+    centróide — ou simplesmente não existir no documento.
+    """
+    for registro in base.values():
+        if registro.get("nome_imovel"):
+            registro["nome_imovel_fonte"] = (
+                registro.get("nome_imovel_fonte") or "texto do PDF"
+            )
+        else:
+            registro["nome_imovel_fonte"] = "não encontrado"
     return base
 
 
@@ -1378,12 +1793,15 @@ def main() -> None:
             else numero_os
         )
         try:
-            texto = extrair_texto_pdf(pdf)
+            texto, n_paginas = ler_pdf(pdf)
             if not es_documento_car(texto):
                 omitidos.append(nome_pdf)
                 print(f"[OMITIDO ] {nome_pdf}  (não parece um documento CAR)")
                 continue
             novo = extrair_dados_car(texto, pdf, numero_os_pdf)
+            # Arsenal de leitura crua (SOMENTE no JSON): texto integral do
+            # PDF, layout detectado, campos lidos e não tratados e alertas.
+            novo["pdf_bruto"] = _montar_pdf_bruto(texto, n_paginas, novo)
             eh_fgov = "Regularização Ambiental - Cadastro Ambiental Rural" in texto
             extraidos.append((eh_fgov, nome_pdf, novo))
         except Exception as erro:
@@ -1428,6 +1846,14 @@ def main() -> None:
                     not tipo_novo.startswith("Recibo")
                     and tipo_anterior.startswith("Recibo")
                 ):
+                    # O registro preservado também recebe o arsenal de leitura
+                    # crua do PDF (se ainda não tiver), para não ficar sem
+                    # texto/alertas só por ter sido preservado.
+                    if not anterior.get("pdf_bruto"):
+                        anterior["pdf_bruto"] = novo.get("pdf_bruto", {})
+                        anterior["pdf_bruto"]["observacao"] = (
+                            "PDF preservado: não sobrescreveu o registro"
+                        )
                     preservados.append(nome_pdf)
                     print(f"[MANTIDO ] {nome_pdf}  (CAR já existe na base)")
                     continue
@@ -1470,6 +1896,7 @@ def main() -> None:
     # Classifica o CENÁRIO de cada documento (família + sistema + UF) em TODOS
     # os registros, inclusive os que já existiam no JSON antes desta versão.
     base = _aplicar_classificacao(base)
+    base = _marcar_fonte_nome(base)
     salvar_json(base)
     try:
         n_filas = salvar_csv(base)
